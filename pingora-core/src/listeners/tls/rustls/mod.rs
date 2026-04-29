@@ -38,6 +38,7 @@ pub struct TlsSettings {
     client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
     callbacks: Option<TlsAcceptCallbacks>,
     offload_threadpool: Option<(usize, usize)>,
+    custom_config: Option<Arc<ServerConfig>>,
 }
 
 pub struct Acceptor {
@@ -58,45 +59,55 @@ impl TlsSettings {
         // rustls 0.23+ requires an explicit CryptoProvider.
         pingora_rustls::install_default_crypto_provider();
 
-        let builder =
-            ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13]);
-        let builder = if let Some(verifier) = self.client_cert_verifier {
-            builder.with_client_cert_verifier(verifier)
+        let config = if let Some(custom_config) = self.custom_config {
+            // A custom ServerConfig takes full control of the TLS
+            // configuration: the certificate/key paths, cert resolver, client
+            // cert verifier, and ALPN settings on TlsSettings are all bypassed.
+            custom_config
         } else {
-            builder.with_no_client_auth()
-        };
-
-        let mut config = if let Some(resolver) = self.cert_resolver {
-            builder.with_cert_resolver(resolver)
-        } else {
-            assert!(
-                !self.cert_path.is_empty() && !self.key_path.is_empty(),
-                "Either set_cert_resolver() or both set_certificate_chain_file() and \
-                 set_private_key_file() must be called before build()."
-            );
-
-            let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
-            else {
-                panic!(
-                    "Failed to load provided certificates \"{}\" or key \"{}\".",
-                    self.cert_path, self.key_path
-                )
+            let builder =
+                ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13]);
+            let builder = if let Some(verifier) = self.client_cert_verifier {
+                builder.with_client_cert_verifier(verifier)
+            } else {
+                builder.with_no_client_auth()
             };
 
-            builder
-                .with_single_cert(certs, key)
-                .explain_err(InternalError, |e| {
-                    format!("Failed to create server listener config: {e}")
-                })
-                .unwrap()
+            let mut config = if let Some(resolver) = self.cert_resolver {
+                builder.with_cert_resolver(resolver)
+            } else {
+                assert!(
+                    !self.cert_path.is_empty() && !self.key_path.is_empty(),
+                    "Either set_cert_resolver() or both set_certificate_chain_file() and \
+                     set_private_key_file() must be called before build()."
+                );
+
+                let Ok(Some((certs, key))) =
+                    load_certs_and_key_files(&self.cert_path, &self.key_path)
+                else {
+                    panic!(
+                        "Failed to load provided certificates \"{}\" or key \"{}\".",
+                        self.cert_path, self.key_path
+                    )
+                };
+
+                builder
+                    .with_single_cert(certs, key)
+                    .explain_err(InternalError, |e| {
+                        format!("Failed to create server listener config: {e}")
+                    })
+                    .unwrap()
+            };
+
+            if let Some(alpn_protocols) = self.alpn_protocols {
+                config.alpn_protocols = alpn_protocols;
+            }
+
+            Arc::new(config)
         };
 
-        if let Some(alpn_protocols) = self.alpn_protocols {
-            config.alpn_protocols = alpn_protocols;
-        }
-
         Acceptor {
-            acceptor: RusTlsAcceptor::from(Arc::new(config)),
+            acceptor: RusTlsAcceptor::from(config),
             callbacks: self.callbacks.map(SharedTlsAcceptCallbacks::from),
             offload: self.offload_threadpool.map(|(shards, threads_per_shard)| {
                 OffloadRuntime::new("downstream TLS offload", shards, threads_per_shard)
@@ -200,6 +211,27 @@ impl TlsSettings {
             client_cert_verifier: None,
             callbacks: None,
             offload_threadpool: None,
+            custom_config: None,
+        })
+    }
+
+    /// Create a new TlsSettings with a custom ServerConfig.
+    ///
+    /// This allows for full control over the rustls ServerConfig,
+    /// including 0-RTT, session resumption, and custom certificate resolvers.
+    pub fn with_server_config(config: Arc<ServerConfig>) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(TlsSettings {
+            alpn_protocols: None,
+            cert_path: String::new(),
+            key_path: String::new(),
+            cert_resolver: None,
+            client_cert_verifier: None,
+            callbacks: None,
+            offload_threadpool: None,
+            custom_config: Some(config),
         })
     }
 
@@ -220,6 +252,7 @@ impl TlsSettings {
             client_cert_verifier: None,
             callbacks: Some(callbacks),
             offload_threadpool: None,
+            custom_config: None,
         })
     }
 }
