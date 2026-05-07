@@ -17,7 +17,7 @@ mod utils;
 use bytes::Bytes;
 use h2::client;
 use http::Request;
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Empty};
 use hyper_util::client::legacy::Client;
 #[cfg(unix)]
 use hyperlocal::{UnixClientExt, Uri};
@@ -87,7 +87,7 @@ async fn test_h2_to_h1() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_2);
 
     let headers = res.headers();
@@ -131,7 +131,7 @@ async fn test_h2_to_h2() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_2);
 
     let headers = res.headers();
@@ -173,8 +173,8 @@ async fn test_h2c_to_h2c() {
     req.headers_mut()
         .insert("x-h2", http::HeaderValue::from_bytes(b"true").unwrap());
     let res = client.request(req).await.unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
-    assert_eq!(res.version(), reqwest::Version::HTTP_2);
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.version(), http::Version::HTTP_2);
 
     let body = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body.as_ref(), b"Hello World!\n");
@@ -195,8 +195,8 @@ async fn test_h1_on_h2c_port() {
     req.headers_mut()
         .insert("x-h2", http::HeaderValue::from_bytes(b"true").unwrap());
     let res = client.request(req).await.unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
-    assert_eq!(res.version(), reqwest::Version::HTTP_11);
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.version(), http::Version::HTTP_11);
 
     let body = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body.as_ref(), b"Hello World!\n");
@@ -218,7 +218,7 @@ async fn test_h2_to_h2_host_override() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_2);
     let headers = res.headers();
     assert_eq!(headers[header::CONTENT_LENGTH], "13");
@@ -245,7 +245,7 @@ async fn test_h2_to_h2_upload() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_2);
     let body = res.text().await.unwrap();
     assert_eq!(body, payload);
@@ -269,7 +269,7 @@ async fn test_h2_to_h1_upload() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_2);
     let body = res.text().await.unwrap();
     assert_eq!(body, payload);
@@ -292,7 +292,7 @@ async fn test_h2_head() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_2);
     let body = res.text().await.unwrap();
     // should not be any body, despite content-length
@@ -306,9 +306,12 @@ async fn test_simple_proxy_uds() {
     let url = Uri::new("/tmp/pingora_proxy.sock", "/").into();
     let client: Client<hyperlocal::UnixConnector, http_body_util::Empty<Bytes>> = Client::unix();
 
-    let res = client.get(url).await.unwrap();
+    let res = client
+        .request(Request::get(url).body(Empty::<Bytes>::new()).unwrap())
+        .await
+        .unwrap();
 
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.status(), StatusCode::OK);
     let (resp, body) = res.into_parts();
 
     let headers = &resp.headers;

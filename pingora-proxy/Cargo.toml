@@ -45,7 +45,7 @@ httparse = { workspace = true }
 tokio-test = "0.4"
 env_logger = "0.11"
 hyper = { version = "1", features = ["client", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
 http-body-util = "0.1"
 tokio-tungstenite = "0.26"
 pingora-limits = { version = "0.8.0", path = "../pingora-limits" }
