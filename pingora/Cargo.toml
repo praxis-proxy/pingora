@@ -40,7 +40,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 env_logger = "0.11"
 reqwest = { version = "0.12", features = ["rustls-tls", "http2"], default-features = false }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
 http-body-util = "0.1"
 async-trait = { workspace = true }
 http = { workspace = true }
