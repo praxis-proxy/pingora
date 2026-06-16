@@ -215,10 +215,38 @@ impl TlsSettings {
         })
     }
 
-    /// Create a new TlsSettings with a custom ServerConfig.
+    /// Create a new [`TlsSettings`] from a pre-built rustls [`ServerConfig`].
     ///
-    /// This allows for full control over the rustls ServerConfig,
-    /// including 0-RTT, session resumption, and custom certificate resolvers.
+    /// This allows full control over the rustls configuration, including
+    /// 0-RTT, session resumption, and custom certificate resolvers.
+    ///
+    /// # Important
+    ///
+    /// When a custom config is provided, [`build`] uses it as-is: the
+    /// certificate/key paths, the cert resolver, the client-cert verifier, and
+    /// the ALPN protocols configured on [`TlsSettings`] are all bypassed. Calls
+    /// to [`enable_h2`], [`set_alpn`], [`set_client_cert_verifier`],
+    /// [`set_cert_resolver`], [`set_certificate_chain_file`], or
+    /// [`set_private_key_file`] made alongside this constructor will compile but
+    /// have no effect. Configure ALPN, client-auth, certificate resolution, and
+    /// all other TLS options directly on the [`ServerConfig`] before passing it
+    /// here. Handshake offload configured via [`set_offload_threadpool`] is
+    /// still honored.
+    ///
+    /// `cert_path` and `key_path` are stored as empty strings because the
+    /// custom config already owns its certificate chain; the empty values are
+    /// never read during [`build`].
+    ///
+    /// [`build`]: Self::build
+    /// [`enable_h2`]: Self::enable_h2
+    /// [`set_alpn`]: Self::set_alpn
+    /// [`set_client_cert_verifier`]: Self::set_client_cert_verifier
+    /// [`set_cert_resolver`]: Self::set_cert_resolver
+    /// [`set_certificate_chain_file`]: Self::set_certificate_chain_file
+    /// [`set_private_key_file`]: Self::set_private_key_file
+    /// [`set_offload_threadpool`]: Self::set_offload_threadpool
+    /// [`ServerConfig`]: pingora_rustls::ServerConfig
+    /// [`TlsSettings`]: Self
     pub fn with_server_config(config: Arc<ServerConfig>) -> Result<Self>
     where
         Self: Sized,
@@ -352,5 +380,76 @@ mod tests {
             .unwrap();
         let res = client.get(format!("https://{addr}")).send().await.unwrap();
         assert_eq!(res.status(), reqwest::StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // Custom ServerConfig (with_server_config) tests
+    // -----------------------------------------------------------------------
+
+    /// A no-op cert resolver for building test [`ServerConfig`] values without
+    /// real certificates.
+    #[derive(Debug)]
+    struct StubResolver;
+
+    impl ResolvesServerCert for StubResolver {
+        fn resolve(
+            &self,
+            _client_hello: pingora_rustls::ClientHello<'_>,
+        ) -> Option<Arc<pingora_rustls::sign::CertifiedKey>> {
+            None
+        }
+    }
+
+    /// Build a minimal [`ServerConfig`] suitable for unit tests.
+    fn stub_server_config() -> Arc<ServerConfig> {
+        pingora_rustls::install_default_crypto_provider();
+        Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(StubResolver)),
+        )
+    }
+
+    #[test]
+    fn with_server_config_stores_custom_config() {
+        let config = stub_server_config();
+
+        let settings = TlsSettings::with_server_config(config.clone()).unwrap();
+        assert!(settings.custom_config.is_some(), "custom_config must be set");
+        assert!(
+            Arc::ptr_eq(settings.custom_config.as_ref().unwrap(), &config),
+            "custom_config must point to the same Arc"
+        );
+    }
+
+    #[test]
+    fn with_server_config_leaves_other_fields_default() {
+        let config = stub_server_config();
+
+        let settings = TlsSettings::with_server_config(config).unwrap();
+        assert!(settings.alpn_protocols.is_none(), "alpn must be None");
+        assert!(settings.cert_path.is_empty(), "cert_path must be empty");
+        assert!(settings.key_path.is_empty(), "key_path must be empty");
+        assert!(
+            settings.client_cert_verifier.is_none(),
+            "client_cert_verifier must be None"
+        );
+    }
+
+    #[test]
+    fn with_server_config_build_uses_custom_config() {
+        pingora_rustls::install_default_crypto_provider();
+        let mut sc = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(StubResolver));
+        sc.alpn_protocols = vec![b"h2".to_vec()];
+        let config = Arc::new(sc);
+
+        let acceptor = TlsSettings::with_server_config(config).unwrap().build();
+        assert_eq!(
+            acceptor.acceptor.config().alpn_protocols,
+            vec![b"h2".to_vec()],
+            "ALPN from custom config must survive build()"
+        );
     }
 }
