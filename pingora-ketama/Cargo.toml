@@ -1,13 +1,17 @@
 [package]
-name = "pingora-ketama"
-version = "0.8.0"
+name = "quixotic-plecostomus-ketama"
+version = "0.8.2"
 description = "Rust port of the nginx consistent hash function"
 authors = ["Pingora Team <pingora@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
-repository = "https://github.com/cloudflare/pingora"
+repository = "https://github.com/praxis-proxy/pingora"
 categories = ["caching", "algorithms"]
 keywords = ["hash", "hashing", "consistent", "pingora"]
+
+[lib]
+name = "pingora_ketama"
+path = "src/lib.rs"
 
 [dependencies]
 crc32fast = "1.3"

@@ -1,11 +1,11 @@
 [package]
-name = "pingora-proxy"
-version = "0.8.0"
+name = "quixotic-plecostomus-proxy"
+version = "0.8.2"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
 rust-version = "1.84"
-repository = "https://github.com/cloudflare/pingora"
+repository = "https://github.com/praxis-proxy/pingora"
 categories = ["asynchronous", "network-programming"]
 keywords = ["async", "http", "proxy", "pingora"]
 exclude = ["tests/*"]
@@ -19,11 +19,11 @@ name = "pingora_proxy"
 path = "src/lib.rs"
 
 [dependencies]
-pingora-error = { version = "0.8.0", path = "../pingora-error" }
-pingora-core = { version = "0.8.0", path = "../pingora-core", default-features = false }
-pingora-cache = { version = "0.8.0", path = "../pingora-cache", default-features = false }
+pingora-error = { version = "0.8.2", path = "../pingora-error", package = "quixotic-plecostomus-error" }
+pingora-core = { version = "0.8.2", path = "../pingora-core", default-features = false, package = "quixotic-plecostomus-core" }
+pingora-cache = { version = "0.8.2", path = "../pingora-cache", default-features = false, package = "quixotic-plecostomus-cache" }
 tokio = { workspace = true, features = ["macros", "net"] }
-pingora-http = { version = "0.8.0", path = "../pingora-http" }
+pingora-http = { version = "0.8.2", path = "../pingora-http", package = "quixotic-plecostomus-http" }
 http = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
@@ -48,9 +48,9 @@ hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
 http-body-util = "0.1"
 tokio-tungstenite = "0.26"
-pingora-limits = { version = "0.8.0", path = "../pingora-limits" }
-pingora-load-balancing = { version = "0.8.0", path = "../pingora-load-balancing", default-features=false }
-pingora-prometheus = { version = "0.8.0", path = "../pingora-prometheus" }
+pingora-limits = { version = "0.8.2", path = "../pingora-limits", package = "quixotic-plecostomus-limits" }
+pingora-load-balancing = { version = "0.8.2", path = "../pingora-load-balancing", default-features = false, package = "quixotic-plecostomus-load-balancing" }
+pingora-prometheus = { version = "0.8.2", path = "../pingora-prometheus", package = "quixotic-plecostomus-prometheus" }
 prometheus = "0"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }

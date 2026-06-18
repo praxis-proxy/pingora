@@ -1,10 +1,10 @@
 [package]
-name = "pingora-openssl"
-version = "0.8.0"
+name = "quixotic-plecostomus-openssl"
+version = "0.8.2"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
-repository = "https://github.com/cloudflare/pingora"
+repository = "https://github.com/praxis-proxy/pingora"
 categories = ["asynchronous", "network-programming"]
 keywords = ["async", "tls", "ssl", "pingora"]
 description = """

@@ -1,10 +1,10 @@
 [package]
-name = "pingora-prometheus"
-version = "0.8.0"
+name = "quixotic-plecostomus-prometheus"
+version = "0.8.2"
 authors = ["Pingora Team at Cloudflare <pingora@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
-repository = "https://github.com/cloudflare/pingora"
+repository = "https://github.com/praxis-proxy/pingora"
 categories = ["asynchronous", "network-programming"]
 keywords = ["async", "http", "prometheus", "pingora"]
 description = """
@@ -16,7 +16,7 @@ name = "pingora_prometheus"
 path = "src/lib.rs"
 
 [dependencies]
-pingora-core = { version = "0.8.0", path = "../pingora-core", default-features = false }
+pingora-core = { version = "0.8.2", path = "../pingora-core", default-features = false, package = "quixotic-plecostomus-core" }
 prometheus = "0.14"
 async-trait = { workspace = true }
 http = { workspace = true }

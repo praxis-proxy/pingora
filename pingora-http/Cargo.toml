@@ -1,10 +1,10 @@
 [package]
-name = "pingora-http"
-version = "0.8.0"
+name = "quixotic-plecostomus-http"
+version = "0.8.2"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
-repository = "https://github.com/cloudflare/pingora"
+repository = "https://github.com/praxis-proxy/pingora"
 categories = ["web-programming"]
 keywords = ["http", "pingora"]
 description = """
@@ -19,7 +19,7 @@ path = "src/lib.rs"
 [dependencies]
 http = { workspace = true }
 bytes = { workspace = true }
-pingora-error = { version = "0.8.0", path = "../pingora-error" }
+pingora-error = { version = "0.8.2", path = "../pingora-error", package = "quixotic-plecostomus-error" }
 
 [features]
 default = []

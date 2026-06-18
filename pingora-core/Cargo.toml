@@ -1,10 +1,10 @@
 [package]
-name = "pingora-core"
-version = "0.8.0"
+name = "quixotic-plecostomus-core"
+version = "0.8.2"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
-repository = "https://github.com/cloudflare/pingora"
+repository = "https://github.com/praxis-proxy/pingora"
 categories = ["asynchronous", "network-programming"]
 keywords = ["async", "http", "network", "pingora"]
 exclude = ["tests/*"]
@@ -19,15 +19,15 @@ name = "pingora_core"
 path = "src/lib.rs"
 
 [dependencies]
-pingora-runtime = { version = "0.8.0", path = "../pingora-runtime" }
-pingora-openssl = { version = "0.8.0", path = "../pingora-openssl", optional = true }
-pingora-boringssl = { version = "0.8.0", path = "../pingora-boringssl", optional = true }
-pingora-pool = { version = "0.8.0", path = "../pingora-pool" }
-pingora-error = { version = "0.8.0", path = "../pingora-error" }
-pingora-timeout = { version = "0.8.0", path = "../pingora-timeout" }
-pingora-http = { version = "0.8.0", path = "../pingora-http" }
-pingora-rustls = { version = "0.8.0", path = "../pingora-rustls", optional = true }
-pingora-s2n = { version = "0.8.0", path = "../pingora-s2n", optional = true }
+pingora-runtime = { version = "0.8.2", path = "../pingora-runtime", package = "quixotic-plecostomus-runtime" }
+pingora-openssl = { version = "0.8.2", path = "../pingora-openssl", optional = true, package = "quixotic-plecostomus-openssl" }
+pingora-boringssl = { version = "0.8.2", path = "../pingora-boringssl", optional = true, package = "quixotic-plecostomus-boringssl" }
+pingora-pool = { version = "0.8.2", path = "../pingora-pool", package = "quixotic-plecostomus-pool" }
+pingora-error = { version = "0.8.2", path = "../pingora-error", package = "quixotic-plecostomus-error" }
+pingora-timeout = { version = "0.8.2", path = "../pingora-timeout", package = "quixotic-plecostomus-timeout" }
+pingora-http = { version = "0.8.2", path = "../pingora-http", package = "quixotic-plecostomus-http" }
+pingora-rustls = { version = "0.8.2", path = "../pingora-rustls", optional = true, package = "quixotic-plecostomus-rustls" }
+pingora-s2n = { version = "0.8.2", path = "../pingora-s2n", optional = true, package = "quixotic-plecostomus-s2n" }
 bstr = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
 tokio-stream = { workspace = true }

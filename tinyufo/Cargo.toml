@@ -1,11 +1,11 @@
 [package]
-name = "TinyUFO"
-version = "0.8.0"
+name = "quixotic-plecostomus-tinyufo"
+version = "0.8.2"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 edition = "2021"
 license = "Apache-2.0"
 description = "In-memory cache implementation with TinyLFU as the admission policy and S3-FIFO as the eviction policy"
-repository = "https://github.com/cloudflare/pingora"
+repository = "https://github.com/praxis-proxy/pingora"
 categories = ["algorithms", "caching"]
 keywords = ["cache", "pingora"]
 

@@ -1,10 +1,10 @@
 [package]
-name = "pingora-timeout"
-version = "0.8.0"
+name = "quixotic-plecostomus-timeout"
+version = "0.8.2"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
-repository = "https://github.com/cloudflare/pingora"
+repository = "https://github.com/praxis-proxy/pingora"
 categories = ["asynchronous"]
 keywords = ["async", "non-blocking", "pingora"]
 description = """

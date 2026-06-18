@@ -1,11 +1,11 @@
 [package]
-name = "pingora-limits"
-version = "0.8.0"
+name = "quixotic-plecostomus-limits"
+version = "0.8.2"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 description = "A library for rate limiting and event frequency estimation"
 edition = "2021"
-repository = "https://github.com/cloudflare/pingora"
+repository = "https://github.com/praxis-proxy/pingora"
 categories = ["algorithms"]
 keywords = ["rate-limit", "pingora"]
 
