@@ -1,3 +1,6 @@
+> **Warn**: This is a fork of https://github.com/cloudflare/pingora which is published
+> for very specific temporary use. DO NOT USE THIS.
+
 # Pingora
 
 ![Pingora banner image](./docs/assets/pingora_banner.png)
