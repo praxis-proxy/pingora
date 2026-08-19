@@ -20,7 +20,7 @@ path = "src/lib.rs"
 
 [dependencies]
 pingora-runtime = { version = "0.8.2", path = "../pingora-runtime", package = "quixotic-plecostomus-runtime" }
-pingora-openssl = { version = "0.8.2", path = "../pingora-openssl", optional = true, package = "quixotic-plecostomus-openssl" }
+pingora-openssl = { version = "0.8.2", path = "../pingora-openssl", optional = true, default-features = false, package = "quixotic-plecostomus-openssl" }
 pingora-boringssl = { version = "0.8.2", path = "../pingora-boringssl", optional = true, package = "quixotic-plecostomus-boringssl" }
 pingora-pool = { version = "0.8.2", path = "../pingora-pool", package = "quixotic-plecostomus-pool" }
 pingora-error = { version = "0.8.2", path = "../pingora-error", package = "quixotic-plecostomus-error" }
@@ -105,7 +105,8 @@ default = []
 dial9 = ["pingora-runtime/dial9"]
 dial9-worker-s3 = ["dial9", "pingora-runtime/dial9-worker-s3"]
 dial9-cpu-profiling = ["dial9", "pingora-runtime/dial9-cpu-profiling"]
-openssl = ["pingora-openssl", "openssl_derived"]
+openssl = ["pingora-openssl", "pingora-openssl/vendored", "openssl_derived"]
+openssl-system = ["pingora-openssl", "pingora-openssl/system", "openssl_derived"]
 boringssl = ["pingora-boringssl", "openssl_derived"]
 rustls = ["pingora-rustls", "any_tls", "dep:x509-parser", "ouroboros"]
 s2n = ["pingora-s2n", "any_tls", "dep:x509-parser", "ouroboros", "lru"]

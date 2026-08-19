@@ -74,6 +74,18 @@ openssl = [
     "openssl_derived",
 ]
 
+## Use [OpenSSL](https://crates.io/crates/openssl) for tls, linking against system shared libraries
+##
+## Requires system libssl and libcrypto. Set OPENSSL_DIR (or OPENSSL_LIB_DIR + OPENSSL_INCLUDE_DIR)
+## if the libraries are not on the default search path.
+openssl-system = [
+    "pingora-core/openssl-system",
+    "pingora-proxy?/openssl-system",
+    "pingora-cache?/openssl-system",
+    "pingora-load-balancing?/openssl-system",
+    "openssl_derived",
+]
+
 ## Use [BoringSSL](https://crates.io/crates/boring) for tls 
 ##
 ## Requires native boring libraries and build tooling

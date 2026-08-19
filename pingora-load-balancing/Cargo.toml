@@ -37,6 +37,7 @@ derivative.workspace = true
 [features]
 default = []
 openssl = ["pingora-core/openssl", "openssl_derived"]
+openssl-system = ["pingora-core/openssl-system", "openssl_derived"]
 boringssl = ["pingora-core/boringssl", "openssl_derived"]
 rustls = ["pingora-core/rustls", "any_tls"]
 s2n = ["pingora-core/s2n", "any_tls"]

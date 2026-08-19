@@ -72,6 +72,7 @@ harness = false
 [features]
 default = []
 openssl = ["pingora-core/openssl"]
+openssl-system = ["pingora-core/openssl-system"]
 boringssl = ["pingora-core/boringssl"]
 rustls = ["pingora-core/rustls"]
 s2n = ["pingora-core/s2n"]

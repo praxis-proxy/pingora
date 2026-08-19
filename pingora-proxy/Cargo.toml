@@ -63,6 +63,7 @@ hyperlocal = "0.9"
 [features]
 default = []
 openssl = ["pingora-core/openssl", "pingora-cache/openssl", "openssl_derived"]
+openssl-system = ["pingora-core/openssl-system", "pingora-cache/openssl-system", "openssl_derived"]
 boringssl = [
     "pingora-core/boringssl",
     "pingora-cache/boringssl",
