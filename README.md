@@ -1,5 +1,9 @@
-> **Warn**: This is a fork of https://github.com/cloudflare/pingora which is published
-> for very specific temporary use. DO NOT USE THIS.
+> **This is a temporary fork of
+> [Cloudflare Pingora](https://github.com/cloudflare/pingora)
+> maintained by the [Praxis](https://github.com/praxis-proxy/praxis)
+> project. It is published to crates.io as `quixotic-plecostomus-*`
+> and is not intended for external use. See [FORK.md](FORK.md) for
+> details.**
 
 # Pingora
 
