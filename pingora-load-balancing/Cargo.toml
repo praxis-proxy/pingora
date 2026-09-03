@@ -1,6 +1,6 @@
 [package]
 name = "quixotic-plecostomus-load-balancing"
-version = "0.8.2"
+version = "0.8.3"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -18,11 +18,11 @@ path = "src/lib.rs"
 
 [dependencies]
 async-trait = { workspace = true }
-pingora-http = { version = "0.8.2", path = "../pingora-http", package = "quixotic-plecostomus-http" }
-pingora-error = { version = "0.8.2", path = "../pingora-error", package = "quixotic-plecostomus-error" }
-pingora-core = { version = "0.8.2", path = "../pingora-core", default-features = false, package = "quixotic-plecostomus-core" }
-pingora-ketama = { version = "0.8.2", path = "../pingora-ketama", package = "quixotic-plecostomus-ketama" }
-pingora-runtime = { version = "0.8.2", path = "../pingora-runtime", package = "quixotic-plecostomus-runtime" }
+pingora-http = { version = "0.8.3", path = "../pingora-http", package = "quixotic-plecostomus-http" }
+pingora-error = { version = "0.8.3", path = "../pingora-error", package = "quixotic-plecostomus-error" }
+pingora-core = { version = "0.8.3", path = "../pingora-core", default-features = false, package = "quixotic-plecostomus-core" }
+pingora-ketama = { version = "0.8.3", path = "../pingora-ketama", package = "quixotic-plecostomus-ketama" }
+pingora-runtime = { version = "0.8.3", path = "../pingora-runtime", package = "quixotic-plecostomus-runtime" }
 arc-swap = "1"
 fnv = "1"
 rand = "0.10"

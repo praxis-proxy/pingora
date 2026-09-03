@@ -1,6 +1,6 @@
 [package]
 name = "quixotic-plecostomus-header-serde"
-version = "0.8.2"
+version = "0.8.3"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -27,6 +27,6 @@ zstd-safe = { version = "7.1.0", features = ["std"] }
 http = { workspace = true }
 bytes = { workspace = true }
 httparse = { workspace = true }
-pingora-error = { version = "0.8.2", path = "../pingora-error", package = "quixotic-plecostomus-error" }
-pingora-http = { version = "0.8.2", path = "../pingora-http", package = "quixotic-plecostomus-http" }
+pingora-error = { version = "0.8.3", path = "../pingora-error", package = "quixotic-plecostomus-error" }
+pingora-http = { version = "0.8.3", path = "../pingora-http", package = "quixotic-plecostomus-http" }
 thread_local = "1.0"

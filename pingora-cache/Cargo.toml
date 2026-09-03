@@ -1,6 +1,6 @@
 [package]
 name = "quixotic-plecostomus-cache"
-version = "0.8.2"
+version = "0.8.3"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -18,12 +18,12 @@ name = "pingora_cache"
 path = "src/lib.rs"
 
 [dependencies]
-pingora-core = { version = "0.8.2", path = "../pingora-core", default-features = false, package = "quixotic-plecostomus-core" }
-pingora-error = { version = "0.8.2", path = "../pingora-error", package = "quixotic-plecostomus-error" }
-pingora-header-serde = { version = "0.8.2", path = "../pingora-header-serde", package = "quixotic-plecostomus-header-serde" }
-pingora-http = { version = "0.8.2", path = "../pingora-http", package = "quixotic-plecostomus-http" }
-pingora-lru = { version = "0.8.2", path = "../pingora-lru", package = "quixotic-plecostomus-lru" }
-pingora-timeout = { version = "0.8.2", path = "../pingora-timeout", package = "quixotic-plecostomus-timeout" }
+pingora-core = { version = "0.8.3", path = "../pingora-core", default-features = false, package = "quixotic-plecostomus-core" }
+pingora-error = { version = "0.8.3", path = "../pingora-error", package = "quixotic-plecostomus-error" }
+pingora-header-serde = { version = "0.8.3", path = "../pingora-header-serde", package = "quixotic-plecostomus-header-serde" }
+pingora-http = { version = "0.8.3", path = "../pingora-http", package = "quixotic-plecostomus-http" }
+pingora-lru = { version = "0.8.3", path = "../pingora-lru", package = "quixotic-plecostomus-lru" }
+pingora-timeout = { version = "0.8.3", path = "../pingora-timeout", package = "quixotic-plecostomus-timeout" }
 bstr = { workspace = true }
 http = { workspace = true }
 indexmap = "1"

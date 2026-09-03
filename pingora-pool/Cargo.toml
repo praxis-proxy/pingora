@@ -1,6 +1,6 @@
 [package]
 name = "quixotic-plecostomus-pool"
-version = "0.8.2"
+version = "0.8.3"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -24,7 +24,7 @@ parking_lot = "0.12"
 dashmap = "6"
 crossbeam-queue = "0.3"
 futures = { workspace = true }
-pingora-timeout = { version = "0.8.2", path = "../pingora-timeout", package = "quixotic-plecostomus-timeout" }
+pingora-timeout = { version = "0.8.3", path = "../pingora-timeout", package = "quixotic-plecostomus-timeout" }
 
 [dev-dependencies]
 tokio-test = "0.4"

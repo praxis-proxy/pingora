@@ -1,6 +1,6 @@
 [package]
 name = "quixotic-plecostomus-prometheus"
-version = "0.8.2"
+version = "0.8.3"
 authors = ["Pingora Team at Cloudflare <pingora@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -16,7 +16,7 @@ name = "pingora_prometheus"
 path = "src/lib.rs"
 
 [dependencies]
-pingora-core = { version = "0.8.2", path = "../pingora-core", default-features = false, package = "quixotic-plecostomus-core" }
+pingora-core = { version = "0.8.3", path = "../pingora-core", default-features = false, package = "quixotic-plecostomus-core" }
 prometheus = "0.14"
 async-trait = { workspace = true }
 http = { workspace = true }

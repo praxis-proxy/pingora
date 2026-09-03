@@ -1,6 +1,6 @@
 [package]
 name = "quixotic-plecostomus"
-version = "0.8.2"
+version = "0.8.3"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -22,12 +22,12 @@ features = ["document-features"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-pingora-core = { version = "0.8.2", path = "../pingora-core", default-features = false, package = "quixotic-plecostomus-core" }
-pingora-http = { version = "0.8.2", path = "../pingora-http", package = "quixotic-plecostomus-http" }
-pingora-timeout = { version = "0.8.2", path = "../pingora-timeout", package = "quixotic-plecostomus-timeout" }
-pingora-load-balancing = { version = "0.8.2", path = "../pingora-load-balancing", optional = true, default-features = false, package = "quixotic-plecostomus-load-balancing" }
-pingora-proxy = { version = "0.8.2", path = "../pingora-proxy", optional = true, default-features = false, package = "quixotic-plecostomus-proxy" }
-pingora-cache = { version = "0.8.2", path = "../pingora-cache", optional = true, default-features = false, package = "quixotic-plecostomus-cache" }
+pingora-core = { version = "0.8.3", path = "../pingora-core", default-features = false, package = "quixotic-plecostomus-core" }
+pingora-http = { version = "0.8.3", path = "../pingora-http", package = "quixotic-plecostomus-http" }
+pingora-timeout = { version = "0.8.3", path = "../pingora-timeout", package = "quixotic-plecostomus-timeout" }
+pingora-load-balancing = { version = "0.8.3", path = "../pingora-load-balancing", optional = true, default-features = false, package = "quixotic-plecostomus-load-balancing" }
+pingora-proxy = { version = "0.8.3", path = "../pingora-proxy", optional = true, default-features = false, package = "quixotic-plecostomus-proxy" }
+pingora-cache = { version = "0.8.3", path = "../pingora-cache", optional = true, default-features = false, package = "quixotic-plecostomus-cache" }
 
 
 # Only used for documenting features, but doesn't work in any other dependency 
@@ -45,7 +45,7 @@ http-body-util = "0.1"
 async-trait = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
-pingora-prometheus = { version = "0.8.2", path = "../pingora-prometheus", package = "quixotic-plecostomus-prometheus" }
+pingora-prometheus = { version = "0.8.3", path = "../pingora-prometheus", package = "quixotic-plecostomus-prometheus" }
 prometheus = "0.14"
 once_cell = { workspace = true }
 bytes = { workspace = true }

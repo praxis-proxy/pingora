@@ -1,6 +1,6 @@
 [package]
 name = "quixotic-plecostomus-memory-cache"
-version = "0.8.2"
+version = "0.8.3"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -17,14 +17,14 @@ name = "pingora_memory_cache"
 path = "src/lib.rs"
 
 [dependencies]
-tinyufo = { version = "0.8.2", path = "../tinyufo", package = "quixotic-plecostomus-tinyufo" }
+tinyufo = { version = "0.8.3", path = "../tinyufo", package = "quixotic-plecostomus-tinyufo" }
 ahash = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 async-trait = { workspace = true }
-pingora-error = { version = "0.8.2", path = "../pingora-error", package = "quixotic-plecostomus-error" }
+pingora-error = { version = "0.8.3", path = "../pingora-error", package = "quixotic-plecostomus-error" }
 log = { workspace = true }
 parking_lot = "0"
-pingora-timeout = { version = "0.8.2", path = "../pingora-timeout", package = "quixotic-plecostomus-timeout" }
+pingora-timeout = { version = "0.8.3", path = "../pingora-timeout", package = "quixotic-plecostomus-timeout" }
 
 [dev-dependencies]
 once_cell = { workspace = true }

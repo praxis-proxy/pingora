@@ -1,6 +1,6 @@
 [package]
 name = "quixotic-plecostomus-timeout"
-version = "0.8.2"
+version = "0.8.3"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
