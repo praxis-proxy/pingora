@@ -62,7 +62,7 @@ only `Cargo.toml` package aliasing is needed:
 
 ```toml
 pingora-core = {
-    version = "0.8.3",
+    version = "0.8.4",
     package = "quixotic-plecostomus-core",
 }
 ```
