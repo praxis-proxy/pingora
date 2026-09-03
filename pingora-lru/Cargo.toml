@@ -20,7 +20,7 @@ path = "src/lib.rs"
 hashbrown = "0"
 parking_lot = "0"
 arrayvec = "0"
-rand = "0.8"
+rand = "0.10"
 
 [dev-dependencies]
 lru = { workspace = true }

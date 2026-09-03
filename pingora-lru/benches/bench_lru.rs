@@ -62,7 +62,7 @@
 //! - At production scale (~100K+ items/shard), plain `promote()` is fastest
 //!   regardless of access pattern.
 
-use rand::distributions::WeightedIndex;
+use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -120,7 +120,7 @@ fn bench_shards<const N: usize>(items: usize, dist: &Arc<WeightedIndex<usize>>) 
     println!("  Single-threaded:");
     {
         let lru = make_lru::<N>(items);
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
         let before = Instant::now();
         for _ in 0..ITERATIONS {
             lru.promote(dist.sample(&mut rng) as u64);
@@ -134,7 +134,7 @@ fn bench_shards<const N: usize>(items: usize, dist: &Arc<WeightedIndex<usize>>) 
 
     for top_n in [0, 3, 10, 50, 100] {
         let lru = make_lru::<N>(items);
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
         let before = Instant::now();
         for _ in 0..ITERATIONS {
             lru.promote_top_n(dist.sample(&mut rng) as u64, top_n);
@@ -158,7 +158,7 @@ fn bench_shards<const N: usize>(items: usize, dist: &Arc<WeightedIndex<usize>>) 
             let dist = Arc::clone(dist);
             let barrier = barrier.clone();
             handlers.push(thread::spawn(move || {
-                let mut rng = thread_rng();
+                let mut rng = rand::rng();
                 barrier.wait();
                 let before = Instant::now();
                 for _ in 0..ITERATIONS {
@@ -184,7 +184,7 @@ fn bench_shards<const N: usize>(items: usize, dist: &Arc<WeightedIndex<usize>>) 
             let dist = Arc::clone(dist);
             let barrier = barrier.clone();
             handlers.push(thread::spawn(move || {
-                let mut rng = thread_rng();
+                let mut rng = rand::rng();
                 barrier.wait();
                 let before = Instant::now();
                 for _ in 0..ITERATIONS {
