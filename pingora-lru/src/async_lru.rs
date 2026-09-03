@@ -27,7 +27,7 @@
 
 use crate::linked_list::LinkedList;
 use hashbrown::HashMap;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::future::Future;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -1027,7 +1027,7 @@ async fn eviction_worker<K, const N: usize>(
 ) where
     K: Send + Sync + Hash + Eq + Default + Clone + 'static,
 {
-    let mut rng = rand::rngs::StdRng::from_entropy();
+    let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
 
     loop {
         tokio::select! {
@@ -1045,8 +1045,8 @@ async fn eviction_worker<K, const N: usize>(
             let shard = if N <= 1 {
                 0
             } else {
-                let a = rng.gen_range(0..N);
-                let b = rng.gen_range(0..N);
+                let a = rng.random_range(0..N);
+                let b = rng.random_range(0..N);
                 if counters.shard_lens[a].load(Ordering::Relaxed)
                     >= counters.shard_lens[b].load(Ordering::Relaxed)
                 {

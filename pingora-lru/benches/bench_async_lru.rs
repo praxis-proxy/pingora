@@ -4,7 +4,7 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use pingora_lru::async_lru::AsyncLru;
-use rand::distributions::WeightedIndex;
+use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -65,7 +65,7 @@ fn bench_peek(c: &mut Criterion) {
                         let barrier = Arc::clone(&barrier);
                         let per_thread = (iters as usize / threads).max(1000);
                         thread::spawn(move || {
-                            let mut rng = thread_rng();
+                            let mut rng = rand::rng();
                             barrier.wait();
                             let start = std::time::Instant::now();
                             for _ in 0..per_thread {
@@ -108,7 +108,7 @@ fn bench_promote(c: &mut Criterion) {
                         let barrier = Arc::clone(&barrier);
                         let per_thread = (iters as usize / threads).max(1000);
                         thread::spawn(move || {
-                            let mut rng = thread_rng();
+                            let mut rng = rand::rng();
                             barrier.wait();
                             let start = std::time::Instant::now();
                             for _ in 0..per_thread {
@@ -151,12 +151,12 @@ fn bench_mixed(c: &mut Criterion) {
                         let barrier = Arc::clone(&barrier);
                         let per_thread = (iters as usize / threads).max(1000);
                         thread::spawn(move || {
-                            let mut rng = thread_rng();
+                            let mut rng = rand::rng();
                             barrier.wait();
                             let start = std::time::Instant::now();
                             for _ in 0..per_thread {
                                 let key = dist.sample(&mut rng) as u64;
-                                if rng.gen_ratio(1, 10) {
+                                if rng.random_ratio(1, 10) {
                                     lru.promote(&key);
                                 } else {
                                     std::hint::black_box(lru.peek(&key));
@@ -198,7 +198,7 @@ fn bench_throughput(c: &mut Criterion) {
                         let barrier = Arc::clone(&barrier);
                         let per_thread = (iters as usize / threads).max(1000);
                         thread::spawn(move || {
-                            let mut rng = thread_rng();
+                            let mut rng = rand::rng();
                             barrier.wait();
                             let start = std::time::Instant::now();
                             for i in 0..per_thread {

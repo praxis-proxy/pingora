@@ -30,7 +30,7 @@ type LinkedList = linked_list::LinkedList<u64>;
 
 use hashbrown::HashMap;
 use parking_lot::RwLock;
-use rand::Rng;
+use rand::{Rng, RngExt};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The LRU with `N` shards
@@ -309,7 +309,7 @@ impl<T, const N: usize> Lru<T, N> {
     /// was observed empty and we exit. Bounded by at most N probes
     /// per outer iteration.
     pub fn evict_to_limit(&self) -> Vec<(T, usize)> {
-        self.evict_to_limit_with_rng(&mut rand::thread_rng())
+        self.evict_to_limit_with_rng(&mut rand::rng())
     }
 
     /// Internal entry point for [`Self::evict_to_limit`] that lets tests
@@ -333,8 +333,8 @@ impl<T, const N: usize> Lru<T, N> {
             let start = if N <= 1 {
                 0
             } else {
-                let a = rng.gen_range(0..N);
-                let b = rng.gen_range(0..N);
+                let a = rng.random_range(0..N);
+                let b = rng.random_range(0..N);
                 if self.shard_len(a) >= self.shard_len(b) {
                     a
                 } else {
