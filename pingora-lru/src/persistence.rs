@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use log::{info, warn};
-use rand::Rng;
+use rand::RngExt;
 use std::fmt;
 use std::fs::{rename, File};
 use std::future::Future;
@@ -450,7 +450,7 @@ fn write_shard_file(
     data: &[u8],
 ) -> Result<(), ShardFileError> {
     let final_path = dir_path.join(format!("{file_name}.{shard}"));
-    let random_suffix: u32 = rand::thread_rng().gen();
+    let random_suffix: u32 = rand::rng().random();
     let temp_path = dir_path.join(format!("{file_name}.{shard}.{random_suffix:08x}.tmp"));
     let mut file = File::create(&temp_path).map_err(|source| ShardFileError::Create {
         path: temp_path.clone(),
