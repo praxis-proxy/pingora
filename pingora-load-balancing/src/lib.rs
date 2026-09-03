@@ -16,12 +16,7 @@
 //! This crate provides common service discovery, health check and load balancing
 //! algorithms for proxies to use.
 
-// https://github.com/mcarton/rust-derivative/issues/112
-// False positive for macro generated code
-#![allow(clippy::non_canonical_partial_ord_impl)]
-
 use arc_swap::ArcSwap;
-use derivative::Derivative;
 use futures::FutureExt;
 pub use http::Extensions;
 use pingora_core::protocols::l4::socket::SocketAddr;
@@ -51,8 +46,7 @@ pub mod prelude {
 }
 
 /// [Backend] represents a server to proxy or connect to.
-#[derive(Derivative)]
-#[derivative(Clone, Hash, PartialEq, PartialOrd, Eq, Ord, Debug)]
+#[derive(Clone, Debug)]
 pub struct Backend {
     /// The address to the backend server.
     pub addr: SocketAddr,
@@ -66,11 +60,39 @@ pub struct Backend {
     /// [SocketAddr] and the same weight but different `ext` data are considered
     /// identical.
     /// See [Extensions] for how to add and read the data.
-    #[derivative(PartialEq = "ignore")]
-    #[derivative(PartialOrd = "ignore")]
-    #[derivative(Hash = "ignore")]
-    #[derivative(Ord = "ignore")]
     pub ext: Extensions,
+}
+
+// `ext` is intentionally excluded from equality, ordering, and hashing: two
+// backends with the same `addr` and `weight` are considered identical
+// regardless of their opaque extension data.
+impl PartialEq for Backend {
+    fn eq(&self, other: &Self) -> bool {
+        self.addr == other.addr && self.weight == other.weight
+    }
+}
+
+impl Eq for Backend {}
+
+impl Hash for Backend {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.addr.hash(state);
+        self.weight.hash(state);
+    }
+}
+
+impl Ord for Backend {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.addr
+            .cmp(&other.addr)
+            .then_with(|| self.weight.cmp(&other.weight))
+    }
+}
+
+impl PartialOrd for Backend {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl Backend {
