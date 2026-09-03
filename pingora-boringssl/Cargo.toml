@@ -21,7 +21,7 @@ boring = "5" # PQ is always enabled in 5
 boring-sys = "5"
 futures-util = { version = "0.3", default-features = false }
 tokio = { workspace = true, features = ["io-util", "net", "macros", "rt-multi-thread"] }
-libc = "0.2.70"
+libc = "0.2.189"
 foreign-types-shared = { version = "0.3" }
 
 
