@@ -39,7 +39,6 @@ tokio-util = { version = "0.7.12", features = ["rt"] }
 async-trait = "0.1.42"
 httparse = "1"
 bytes = "1.0"
-derivative = "2.2.0"
 http = "1"
 log = "0.4"
 futures = "0.3"
