@@ -30,7 +30,6 @@ tokio = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
 http = { workspace = true }
-derivative.workspace = true
 
 [dev-dependencies]
 
