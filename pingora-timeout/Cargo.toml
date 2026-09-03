@@ -26,7 +26,7 @@ tokio = { workspace = true, features = [
 pin-project-lite = "0.2"
 once_cell = { workspace = true }
 parking_lot = "0.12"
-thread_local = "1.0"
+thread_local = "1.1"
 
 [dev-dependencies]
 bencher = "0.1.5"

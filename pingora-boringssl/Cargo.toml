@@ -17,11 +17,11 @@ name = "pingora_boringssl"
 path = "src/lib.rs"
 
 [dependencies]
-boring = { version = "4.5", features = ["pq-experimental"] }
-boring-sys = "4.5"
+boring = { version = "4.22", features = ["pq-experimental"] }
+boring-sys = "4.22"
 futures-util = { version = "0.3", default-features = false }
 tokio = { workspace = true, features = ["io-util", "net", "macros", "rt-multi-thread"] }
-libc = "0.2.70"
+libc = "0.2.189"
 foreign-types-shared = { version = "0.3" }
 
 

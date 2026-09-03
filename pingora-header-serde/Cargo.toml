@@ -22,11 +22,11 @@ name = "trainer"
 path = "src/trainer.rs"
 
 [dependencies]
-zstd = "0.13.1"
-zstd-safe = { version = "7.1.0", features = ["std"] }
+zstd = "0.13.3"
+zstd-safe = { version = "7.2.4", features = ["std"] }
 http = { workspace = true }
 bytes = { workspace = true }
 httparse = { workspace = true }
 pingora-error = { version = "0.8.4", path = "../pingora-error", package = "quixotic-plecostomus-error" }
 pingora-http = { version = "0.8.4", path = "../pingora-http", package = "quixotic-plecostomus-http" }
-thread_local = "1.0"
+thread_local = "1.1"

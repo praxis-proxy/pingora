@@ -16,6 +16,6 @@ path = "src/lib.rs"
 
 [dependencies]
 pingora-error = { version = "0.8.4", path = "../pingora-error", package = "quixotic-plecostomus-error" }
-ring = "0.17.12"
+ring = "0.17.14"
 s2n-tls = "0.3"
 s2n-tls-tokio = "0.3"
