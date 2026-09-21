@@ -102,6 +102,30 @@ pub mod services;
 pub mod upstreams;
 pub mod utils;
 
+/// Crypto provider installation for tests.
+///
+/// Pingora installs no rustls `CryptoProvider` — selecting one is the
+/// application's job, so that the choice lives in a single place the operator
+/// controls. `pingora-rustls` also enables rustls' `custom-provider` feature,
+/// which removes rustls' implicit fallback to a built-in provider. Together
+/// that means a test process which builds any `ServerConfig` or `ClientConfig`
+/// must install a provider first, or rustls panics.
+///
+/// Tests must not depend on some *other* test having installed one first:
+/// ordering across test threads is not guaranteed, so that produces failures
+/// that come and go. Every test that touches TLS calls [`install`] itself.
+#[cfg(all(test, feature = "rustls"))]
+pub(crate) mod test_crypto {
+    /// Install a `CryptoProvider` for this test process.
+    ///
+    /// `aws_lc_rs` is arbitrary — these tests exercise pingora plumbing, not
+    /// any particular provider. Repeat calls are no-ops, so this is safe to
+    /// call unconditionally at the top of a test.
+    pub(crate) fn install() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
 pub use pingora_error::{ErrorType::*, *};
 
 // If both openssl and boringssl are enabled, prefer boringssl.

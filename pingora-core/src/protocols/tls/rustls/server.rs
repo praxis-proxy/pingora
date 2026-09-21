@@ -153,7 +153,13 @@ mod tests {
         }
 
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::ring::default_provider()
+            // Report the schemes of the provider this process actually
+            // installed. Naming a provider directly here would both assert
+            // against the wrong one and make the test depend on that
+            // provider's rustls feature being enabled by some unrelated
+            // dependency.
+            rustls::crypto::CryptoProvider::get_default()
+                .expect("tests must install a CryptoProvider before building a config")
                 .signature_verification_algorithms
                 .supported_schemes()
         }

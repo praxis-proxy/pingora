@@ -61,8 +61,9 @@ impl TlsConnector {
     where
         Self: Sized,
     {
-        // rustls 0.23+ requires an explicit CryptoProvider.
-        pingora_rustls::install_default_crypto_provider();
+        // rustls 0.23+ requires an explicit CryptoProvider, installed by the
+        // application before any connector is built. Pingora selects none, so
+        // that the choice lives in exactly one place the operator controls.
 
         // NOTE: Rustls only supports TLS 1.2 & 1.3
 

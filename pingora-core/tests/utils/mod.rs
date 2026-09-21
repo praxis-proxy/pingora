@@ -126,6 +126,22 @@ impl MyServer {
 
 pub static TEST_SERVER: Lazy<MyServer> = Lazy::new(MyServer::start);
 
+/// Install a rustls `CryptoProvider` for this test process.
+///
+/// Pingora installs none — selecting a provider is the application's job — and
+/// `pingora-rustls` enables rustls' `custom-provider`, which removes the
+/// implicit fallback to a built-in provider. Without this the server threads
+/// panic on the first `ServerConfig` they build.
+///
+/// `aws_lc_rs` is arbitrary here; these tests exercise pingora, not a
+/// provider. Repeat calls are no-ops.
+#[cfg(feature = "rustls")]
+fn install_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 pub fn init() {
+    #[cfg(feature = "rustls")]
+    install_crypto_provider();
     let _ = *TEST_SERVER;
 }
