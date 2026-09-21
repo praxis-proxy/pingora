@@ -435,6 +435,7 @@ mod tests {
     // Both server and client are using the same custom protocol
     #[tokio::test]
     async fn test_custom_client_custom_upstream() {
+        crate::test_crypto::install();
         let port = get_available_port().await;
         let custom_protocol = b"custom".to_vec();
 

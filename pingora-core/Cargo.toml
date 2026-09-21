@@ -94,13 +94,30 @@ hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
 http-body-util = "0.1"
 rstest = "0.23.0"
-# Only used for types in tests; the crypto provider arrives through
-# pingora-rustls, so no provider feature is selected here.
+# Tests need a CryptoProvider of their own. Pingora installs none — that is
+# the application's choice — so `aws_lc_rs` is selected here purely to give the
+# test process something to install. It is a dev-dependency feature and does
+# not reach the shipped library. `custom-provider` (set by pingora-rustls)
+# still suppresses any implicit fallback, so tests must install explicitly.
 rustls = { version = "0.23", default-features = false, features = [
+    "aws_lc_rs",
     "logging",
     "std",
     "tls12",
 ] }
+# To run these tests against an OpenSSL-backed provider instead, swap the
+# provider feature above for the crate below and change the install call in
+# `test_crypto::install()` and `tests/utils/mod.rs` to `rustls_openssl::default_provider()`.
+#
+# Verified working 2026-09-21 against the `fix/fips-self-report` branch of
+# rustls-openssl: the full suite passes identically, and the test binaries
+# link /lib64/libcrypto.so.3. Not enabled by default because it would make
+# `cargo test` require system OpenSSL for every contributor, to cover a
+# provider this crate is deliberately agnostic about.
+#
+# rustls-openssl = "0.4"                                    # published
+# rustls-openssl = { path = "../../rustls-openssl-fips" }   # local FIPS patches
+
 
 [[bench]]
 name = "h1_pipelining"

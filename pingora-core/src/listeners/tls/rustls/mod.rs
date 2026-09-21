@@ -56,8 +56,9 @@ impl TlsSettings {
     ///
     /// Todo: Return a result instead of panicking XD
     pub fn build(self) -> Acceptor {
-        // rustls 0.23+ requires an explicit CryptoProvider.
-        pingora_rustls::install_default_crypto_provider();
+        // rustls 0.23+ requires an explicit CryptoProvider, installed by the
+        // application before any listener is built. Pingora selects none, so
+        // that the choice lives in exactly one place the operator controls.
 
         let config = if let Some(custom_config) = self.custom_config {
             // A custom ServerConfig takes full control of the TLS
@@ -337,12 +338,14 @@ mod tests {
     use pingora_rustls::load_certs_and_key_files;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    use crate::test_crypto::install as install_test_crypto_provider;
+
     #[tokio::test]
     async fn test_from_server_config_handshake() {
         // Build a rustls ServerConfig by hand, as a server whose key material
         // arrives in memory (e.g. from a secrets manager) would. The fixture
         // files stand in for that material here.
-        pingora_rustls::install_default_crypto_provider();
+        install_test_crypto_provider();
         let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
         let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
         let (certs, key) = load_certs_and_key_files(&cert_path, &key_path)
@@ -402,7 +405,7 @@ mod tests {
 
     /// Build a minimal [`ServerConfig`] suitable for unit tests.
     fn stub_server_config() -> Arc<ServerConfig> {
-        pingora_rustls::install_default_crypto_provider();
+        install_test_crypto_provider();
         Arc::new(
             ServerConfig::builder()
                 .with_no_client_auth()
@@ -438,7 +441,7 @@ mod tests {
 
     #[test]
     fn with_server_config_build_uses_custom_config() {
-        pingora_rustls::install_default_crypto_provider();
+        install_test_crypto_provider();
         let mut sc = ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(StubResolver));
