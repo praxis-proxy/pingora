@@ -17,9 +17,13 @@ path = "src/lib.rs"
 [dependencies]
 log = "0.4.21"
 pingora-error = { version = "0.9.0", path = "../pingora-error", package = "quixotic-plecostomus-error" }
-ring = "0.17.12"
+# No crypto provider is selected here, deliberately. This crate performs no
+# cryptography of its own: it loads PEM files, re-exports rustls types, and
+# borrows a hash from whichever `CryptoProvider` the application installs.
+# `custom-provider` disables rustls' implicit fallback to a built-in provider,
+# so a process that installs none fails rather than quietly picking one.
 rustls = { version = "0.23.12", default-features = false, features = [
-    "ring",
+    "custom-provider",
     "logging",
     "std",
     "tls12",
@@ -28,8 +32,30 @@ rustls-native-certs = "0.7.1"
 rustls-pemfile = "2.1.2"
 rustls-pki-types = "1.7.0"
 tokio-rustls = { version = "0.26.0", default-features = false, features = [
-    "ring",
     "logging",
     "tls12",
 ] }
 no_debug = "3.1.0"
+
+[dev-dependencies]
+# Tests need a provider to install, since this crate ships none. `aws_lc_rs`
+# is arbitrary — the tests assert the digest value, not the provider.
+rustls = { version = "0.23.12", default-features = false, features = [
+    "aws_lc_rs",
+    "logging",
+    "std",
+    "tls12",
+] }
+# To run these tests against an OpenSSL-backed provider instead, swap the
+# provider feature above for the crate below and change the install call in
+# `install_test_provider()` to `rustls_openssl::default_provider()`.
+#
+# Verified working 2026-09-21 against the `fix/fips-self-report` branch of
+# rustls-openssl: the full suite passes identically, and the test binaries
+# link /lib64/libcrypto.so.3. Not enabled by default because it would make
+# `cargo test` require system OpenSSL for every contributor, to cover a
+# provider this crate is deliberately agnostic about.
+#
+# rustls-openssl = "0.4"                                    # published
+# rustls-openssl = { path = "../../rustls-openssl-fips" }   # local FIPS patches
+

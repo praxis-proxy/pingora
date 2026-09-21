@@ -640,6 +640,9 @@ mod test {
     async fn test_listen_tls() {
         use tokio::io::AsyncReadExt;
 
+        #[cfg(feature = "rustls")]
+        crate::test_crypto::install();
+
         let addr = "127.0.0.1:7103";
         let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
         let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
@@ -680,6 +683,9 @@ mod test {
     #[cfg(feature = "any_tls")]
     async fn test_listen_tls_with_offload() {
         use tokio::io::AsyncReadExt;
+
+        #[cfg(feature = "rustls")]
+        crate::test_crypto::install();
 
         const REQUESTS: usize = 8;
 
