@@ -117,6 +117,7 @@ impl TlsConnector {
                 config.key_log = Arc::new(KeyLogFile::new());
             }
         }
+        require_extended_master_secret(&mut config);
 
         Ok(Connector {
             ctx: Arc::new(TlsConnector {
@@ -196,6 +197,7 @@ where
             )?;
             // Preserve keylog setting from original config
             updated_config.key_log = Arc::clone(&config.key_log);
+            require_extended_master_secret(&mut updated_config);
             Some(updated_config)
         }
     };
@@ -208,6 +210,7 @@ where
                 .with_no_client_auth();
 
         updated_config.key_log = Arc::clone(&config.key_log);
+        require_extended_master_secret(&mut updated_config);
         updated_config_opt = Some(updated_config);
     }
 
@@ -383,5 +386,43 @@ impl RusTlsServerCertVerifier for CustomServerCertVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.delegate.supported_verify_schemes()
+    }
+}
+
+/// Require the Extended Master Secret extension (RFC 7627) on every TLS 1.2
+/// session this connector negotiates.
+///
+/// TLS 1.3 binds its keys to the handshake transcript by design; TLS 1.2 only
+/// does so with this extension, which is why NIST SP 800-52r2 requires it and
+/// why rustls' own `ClientConfig::fips()` reports `false` without it. Every
+/// modern peer supports it, so the cost is refusing handshakes with peers that
+/// do not, which is the intended outcome in a FIPS deployment.
+fn require_extended_master_secret(config: &mut RusTlsClientConfig) {
+    config.require_ems = true;
+}
+
+#[cfg(test)]
+mod ems_tests {
+    use super::*;
+
+    #[test]
+    fn connector_config_requires_extended_master_secret() {
+        crate::test_crypto::install();
+        let connector = Connector::new(None);
+        assert!(
+            connector.ctx.config.require_ems,
+            "upstream ClientConfig must require the Extended Master Secret"
+        );
+    }
+
+    #[test]
+    fn helper_sets_require_ems_on_a_fresh_config() {
+        crate::test_crypto::install();
+        let mut config = RusTlsClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        assert!(!config.require_ems, "rustls defaults require_ems to false");
+        require_extended_master_secret(&mut config);
+        assert!(config.require_ems);
     }
 }
