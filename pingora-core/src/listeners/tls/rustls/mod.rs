@@ -418,7 +418,10 @@ mod tests {
         let config = stub_server_config();
 
         let settings = TlsSettings::with_server_config(config.clone()).unwrap();
-        assert!(settings.custom_config.is_some(), "custom_config must be set");
+        assert!(
+            settings.custom_config.is_some(),
+            "custom_config must be set"
+        );
         assert!(
             Arc::ptr_eq(settings.custom_config.as_ref().unwrap(), &config),
             "custom_config must point to the same Arc"
