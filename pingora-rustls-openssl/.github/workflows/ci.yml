@@ -1,0 +1,115 @@
+
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --features vendored
+      # https://github.com/rust-lang/cargo/issues/6669
+      - name: cargo test --doc
+        run: cargo test --doc --features vendored
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt -- --check -l
+      # These also enforce clippy.toml's ban on rust-openssl APIs that wrap OpenSSL
+      # functions deprecated in 3.0, which bypass the provider layer and so never reach
+      # the FIPS module. See src/hash.rs's provider-routing test for why that matters.
+      - run: cargo clippy --features vendored --all-targets -- -D warnings
+      - run: cargo clippy --features vendored --no-default-features --all-targets -- -D warnings
+      # Catches the same functions declared as raw FFI, which clippy cannot see.
+      - name: No deprecated OpenSSL APIs
+        run: ./ci/check-deprecated-apis.sh
+
+  test-fips-1-1-1:
+    name: Test using FIPS openssl 1.1.1
+    runs-on: ubuntu-latest
+    container:
+      image: registry.access.redhat.com/ubi8/ubi:latest
+    steps:
+      - name: Install dependencies
+        run: dnf install -y gcc openssl-devel
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      # Use single thread on FIPS to avoid running out of entropy
+      - name: Run cargo test --features fips
+        run: cargo test --tests --features fips -- --test-threads=1
+
+  test-fips-openssl-3:
+    name: Test using FIPS openssl 3
+    runs-on: ubuntu-latest
+    container:
+      image: registry.access.redhat.com/ubi9/ubi:latest
+    steps:
+      - name: Install dependencies
+        run: dnf install -y gcc openssl-devel
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --tests --features fips -- --test-threads=1
+
+  test-no-chacha:
+    name: Test using OpenSSL without ChaCha
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build openssl
+        run: ./ci/build-openssl-no-chacha.sh
+      - name: cargo build
+        run: |
+          OPENSSL_DIR=$GITHUB_WORKSPACE/ci/openssl-no-chacha \
+          LD_LIBRARY_PATH=$OPENSSL_DIR/lib64:$LD_LIBRARY_PATH \
+          cargo test
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: llvm-tools
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate coverage
+        run: cargo llvm-cov --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
