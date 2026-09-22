@@ -122,7 +122,7 @@ only `Cargo.toml` package aliasing is needed:
 
 ```toml
 pingora-core = {
-    version = "0.9.0",
+    version = "0.10.0",
     package = "quixotic-plecostomus-core",
 }
 ```
@@ -145,7 +145,7 @@ first-class dependency with clear provenance.
 | **Org fork** | https://github.com/praxis-proxy/pingora |
 | **Base tag** | 0.9.0 |
 | **License** | Apache 2.0 (unchanged from upstream) |
-| **crates.io** | `quixotic-plecostomus-*` v0.9.0 |
+| **crates.io** | `quixotic-plecostomus-*` v0.10.0 (pingora crates); `quixotic-plecostomus-rustls-openssl` v0.4.1 |
 
 [upstream]: https://github.com/cloudflare/pingora
 [rustls-openssl]: https://github.com/tofay/rustls-openssl

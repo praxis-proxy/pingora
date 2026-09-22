@@ -1,6 +1,6 @@
 [package]
 name = "quixotic-plecostomus-ketama"
-version = "0.9.0"
+version = "0.10.0"
 description = "Rust port of the nginx consistent hash function"
 authors = ["Pingora Team <pingora@cloudflare.com>"]
 license = "Apache-2.0"
