@@ -103,3 +103,30 @@ jobs:
       - name: Run cargo machete
         run: |
           [[ ${{ matrix.toolchain }} != 1.97.1 ]] || (cargo install cargo-machete --version 0.7.0 && cargo machete)
+
+  # The vendored rustls provider exists to reach the RHEL OpenSSL FIPS module,
+  # so it is built and tested on UBI 9 with Red Hat's toolchain against the
+  # system libcrypto (never a vendored one), with the FIPS provider active in
+  # the tests, the way its upstream CI does. Selecting the crate with -p keeps
+  # pingora-openssl's `vendored` feature out of the build.
+  rustls-openssl-fips:
+    runs-on: ubuntu-24.04
+    container:
+      # ubi9/ubi 9.8, pinned by digest; see FORK.md
+      image: registry.access.redhat.com/ubi9/ubi@sha256:a4b9ec09b1e790a53ef25b7777c539976abe519248264298e5194dcbceac8c31
+    env:
+      OPENSSL_NO_VENDOR: "1"
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install build dependencies
+        run: dnf install -y --setopt=install_weak_deps=False rust-toolset openssl-devel gcc make
+
+      - name: Test against the system OpenSSL with the FIPS provider active
+        run: cargo test -p quixotic-plecostomus-rustls-openssl --features fips -- --test-threads=1
+
+      - name: No OpenSSL APIs deprecated in 3.0
+        working-directory: pingora-rustls-openssl
+        run: ./ci/check-deprecated-apis.sh

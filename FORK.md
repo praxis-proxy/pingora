@@ -60,6 +60,46 @@ body forwarding edge case.
 `pingora-proxy/src/proxy_h1.rs`,
 `pingora-proxy/src/proxy_h2.rs`
 
+### 4. Provider-agnostic rustls backend
+
+`pingora-rustls` no longer depends on `ring` and
+installs no rustls `CryptoProvider`; rustls'
+`custom-provider` feature makes a missing install a
+loud failure instead of a silent default. The
+application chooses the provider and installs it
+before any service is constructed. This is what lets
+Praxis run all cryptography in the RHEL OpenSSL FIPS
+provider. Upstream still hardcodes `ring`.
+`pingora-s2n` is untouched.
+
+**Files:** `pingora-rustls/`,
+`pingora-core/src/connectors/tls/rustls/mod.rs`,
+`pingora-core/src/listeners/tls/rustls/mod.rs`
+
+### 5. Extended Master Secret on upstream TLS 1.2
+
+Every upstream `ClientConfig` the rustls connector
+builds sets `require_ems` (RFC 7627), which NIST
+SP 800-52r2 requires and without which rustls reports
+a config as not FIPS.
+
+**Files:** `pingora-core/src/connectors/tls/rustls/mod.rs`
+
+### 6. Vendored rustls-openssl provider
+
+`pingora-rustls-openssl/` is
+[tofay/rustls-openssl][rustls-openssl] (MIT) at 0.4.1
+plus its pull request #44, which routes the last
+legacy OpenSSL calls through the EVP provider APIs so
+they reach the FIPS module and adds the
+`SigningKey::public_key` override Praxis needs to
+load certificates. It is published as
+`quixotic-plecostomus-rustls-openssl` with the
+`rustls_openssl` library name unchanged. The copy is
+a snapshot; commit-level history stays upstream.
+When upstream releases those changes Praxis switches
+back and the copy is removed.
+
 The fork also carries dependency-hygiene changes:
 dropping the unmaintained `derivative` crate,
 replacing the archived `serde_yaml` with `yaml_serde`,
@@ -70,7 +110,8 @@ fork infrastructure scaffolding.
 ## Crate Naming
 
 The fork is published to crates.io as
-`quixotic-plecostomus-*` (22 crates). The name was
+`quixotic-plecostomus-*` (22 pingora crates plus the
+vendored `quixotic-plecostomus-rustls-openssl`). The name was
 chosen to avoid appearing in search results for
 "Pingora" or "Praxis", since the fork is temporary
 and not intended for external use.
@@ -107,5 +148,6 @@ first-class dependency with clear provenance.
 | **crates.io** | `quixotic-plecostomus-*` v0.9.0 |
 
 [upstream]: https://github.com/cloudflare/pingora
+[rustls-openssl]: https://github.com/tofay/rustls-openssl
 [pr726]: https://github.com/cloudflare/pingora/pull/726
 [pr908]: https://github.com/cloudflare/pingora/pull/908

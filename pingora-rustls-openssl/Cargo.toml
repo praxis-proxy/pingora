@@ -1,13 +1,22 @@
+# Vendored from https://github.com/tofay/rustls-openssl (MIT) at 0.4.1 plus
+# its pull request #44 (FIPS provider routing). Published under the fork's
+# crate namespace so praxis can depend on it from crates.io; the library
+# name is unchanged so consumer code still says `rustls_openssl::`.
+# See FORK.md, "Vendored rustls-openssl provider".
 [package]
-name = "rustls-openssl"
+name = "quixotic-plecostomus-rustls-openssl"
 authors = ["Tom Fay <tom@teamfay.co.uk>"]
 version = "0.4.1"
 edition = "2024"
 license = "MIT"
-description = "Rustls crypto provider for OpenSSL"
-homepage = "https://github.com/tofay/rustls-openssl"
-repository = "https://github.com/tofay/rustls-openssl"
+description = "Rustls crypto provider for OpenSSL (praxis fork of rustls-openssl)"
+homepage = "https://github.com/praxis-proxy/pingora"
+repository = "https://github.com/praxis-proxy/pingora"
 readme = "README.md"
+
+[lib]
+name = "rustls_openssl"
+path = "src/lib.rs"
 
 [dependencies]
 foreign-types = "0.3.1"
@@ -18,7 +27,9 @@ rustls = { version = "0.23.20", default-features = false }
 zeroize = "1.8.1"
 
 [features]
-default = ["tls12", "prefer-post-quantum"]
+# `prefer-post-quantum` is not a default here: the RHEL 9 FIPS module has no
+# ML-KEM, so offering the hybrid first buys nothing in the target deployment.
+default = ["tls12"]
 fips = []
 tls12 = ["rustls/tls12"]
 prefer-post-quantum = []
