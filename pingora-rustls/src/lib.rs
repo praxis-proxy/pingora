@@ -63,10 +63,13 @@
 //! library, so the cryptography is performed by `libcrypto.so` rather than by
 //! a statically linked Rust implementation. Note it is a *separate crate*, not
 //! a rustls feature — rustls ships only `ring` and `aws-lc-rs`, so there is no
-//! `rustls = { features = ["openssl"] }` to enable:
+//! `rustls = { features = ["openssl"] }` to enable. This workspace vendors it
+//! (see `pingora-rustls-openssl/` and FORK.md) as
+//! `quixotic-plecostomus-rustls-openssl`, keeping the `rustls_openssl` library
+//! name:
 //!
 //! ```toml
-//! rustls-openssl = "0.4"
+//! rustls-openssl = { version = "0.4", package = "quixotic-plecostomus-rustls-openssl" }
 //! ```
 //!
 //! ```ignore
@@ -118,12 +121,12 @@ use log::warn;
 pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};
 use pingora_error::{Error, ErrorType, OrErr, Result};
 
+use rustls::crypto::hash::{Hash, HashAlgorithm};
 pub use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 pub use rustls::server::{
     ClientCertVerifierBuilder, ClientHello, ResolvesServerCert, WebPkiClientVerifier,
 };
 pub use rustls::sign;
-use rustls::crypto::hash::{Hash, HashAlgorithm};
 pub use rustls::{
     client::WebPkiServerVerifier, crypto::CryptoProvider, version, CertificateError, ClientConfig,
     DigitallySignedStruct, Error as RusTlsError, KeyLogFile, RootCertStore, ServerConfig,
@@ -336,8 +339,7 @@ mod tests {
         // let this assert the digest value rather than only its length. A
         // provider wired to the wrong hash would produce 48 bytes here.
         let cert = CertificateDer::from(b"abc".to_vec());
-        let expected =
-            b"\xba\x78\x16\xbf\x8f\x01\xcf\xea\x41\x41\x40\xde\x5d\xae\x22\x23\
+        let expected = b"\xba\x78\x16\xbf\x8f\x01\xcf\xea\x41\x41\x40\xde\x5d\xae\x22\x23\
               \xb0\x03\x61\xa3\x96\x17\x7a\x9c\xb4\x10\xff\x61\xf2\x00\x15\xad";
 
         assert_eq!(hash_certificate(&cert), expected.to_vec());
