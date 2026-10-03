@@ -113,6 +113,7 @@ mod tests {
     use crate::listeners::TlsAccept;
     use crate::protocols::l4::stream::Stream;
     use crate::protocols::tls::TlsRef;
+    use crate::services::listening::handshake_was_abandoned;
     use async_trait::async_trait;
     use pingora_error::{BError, ErrorType::TLSHandshakeFailure};
     use pingora_rustls::{
@@ -270,9 +271,10 @@ mod tests {
             .build();
         let err = server_handshake_error(acceptor, |stream| async move { drop(stream) }).await;
 
-        assert_eq!(err.etype, TLSHandshakeFailure);
+        assert_eq!(err.etype, TLSHandshakeFailure, "{err}");
         let io_err = io_root_cause(&err).expect("the io::Error cause should survive");
         assert_eq!(io_err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+        assert!(handshake_was_abandoned(&err), "{err}");
     }
 
     #[tokio::test]
@@ -286,9 +288,10 @@ mod tests {
         let err =
             server_handshake_error(settings.build(), |stream| async move { drop(stream) }).await;
 
-        assert_eq!(err.etype, TLSHandshakeFailure);
+        assert_eq!(err.etype, TLSHandshakeFailure, "{err}");
         let io_err = io_root_cause(&err).expect("the io::Error cause should survive");
         assert_eq!(io_err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+        assert!(handshake_was_abandoned(&err), "{err}");
     }
 
     #[tokio::test]
@@ -302,10 +305,11 @@ mod tests {
         })
         .await;
 
-        assert_eq!(err.etype, TLSHandshakeFailure);
+        assert_eq!(err.etype, TLSHandshakeFailure, "{err}");
         let io_err = io_root_cause(&err).expect("the io::Error cause should survive");
         assert_eq!(io_err.kind(), io::ErrorKind::InvalidData, "{err}");
         assert!(rustls_root_cause(&err).is_some(), "{err}");
+        assert!(!handshake_was_abandoned(&err), "{err}");
     }
 
     #[tokio::test]
@@ -319,7 +323,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(err.etype, TLSHandshakeFailure);
+        assert_eq!(err.etype, TLSHandshakeFailure, "{err}");
         assert!(
             matches!(
                 rustls_root_cause(&err),
@@ -329,6 +333,7 @@ mod tests {
             ),
             "{err}"
         );
+        assert!(!handshake_was_abandoned(&err), "{err}");
     }
 
     #[tokio::test]
@@ -352,7 +357,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(err.etype, TLSHandshakeFailure);
+        assert_eq!(err.etype, TLSHandshakeFailure, "{err}");
         assert!(
             matches!(
                 rustls_root_cause(&err),
@@ -360,5 +365,6 @@ mod tests {
             ),
             "{err}"
         );
+        assert!(!handshake_was_abandoned(&err), "{err}");
     }
 }
