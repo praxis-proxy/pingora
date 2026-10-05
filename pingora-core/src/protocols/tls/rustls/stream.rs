@@ -316,7 +316,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerStream<T> {
 
         let stream = accept
             .await
-            .explain_err(TLSHandshakeFailure, |e| format!("tls connect error: {e}"))?;
+            .or_err(TLSHandshakeFailure, "tls connect error")?;
         self.stream = Some(RusTlsStream::Server(stream));
         Ok(())
     }

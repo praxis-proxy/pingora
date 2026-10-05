@@ -23,7 +23,7 @@ openssl backends.
 
 ## Changes From Upstream
 
-The fork is based on upstream **0.9.0** with three
+The fork is based on upstream **0.9.0** with seven
 functional changes:
 
 ### 1. Custom rustls `ServerConfig` support
@@ -99,6 +99,30 @@ load certificates. It is published as
 a snapshot; commit-level history stays upstream.
 When upstream releases those changes Praxis switches
 back and the copy is removed.
+
+### 7. Abandoned TLS handshakes log at debug
+
+A client that connects and hangs up before the TLS
+handshake finishes (a Kubernetes TCP probe, a load
+balancer health check, a port scanner) is logged at
+`debug` instead of `error`. Real failures, such as
+protocol errors, received alerts, missing client
+certificates and the handshake timeout, still log at
+`error`. To tell them apart, the rustls server
+handshake keeps the underlying `io::Error` as the
+error's cause instead of flattening it into the
+context string. Only the rustls backend does this;
+boringssl, openssl and s2n are unchanged.
+
+A client that rejects the server certificate and
+disconnects without sending an alert looks the same
+as a probe, so it also logs at `debug`. Upstream
+still logs every failed downstream handshake at
+`error`.
+
+**Files:** `pingora-core/src/services/listening.rs`,
+`pingora-core/src/protocols/tls/rustls/server.rs`,
+`pingora-core/src/protocols/tls/rustls/stream.rs`
 
 The fork also carries dependency-hygiene changes:
 dropping the unmaintained `derivative` crate,

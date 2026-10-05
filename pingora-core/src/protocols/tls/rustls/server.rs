@@ -59,7 +59,7 @@ pub async fn handshake<S: IO>(acceptor: &Acceptor, io: S) -> Result<TlsStream<S>
     stream
         .accept()
         .await
-        .explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
+        .or_err(TLSHandshakeFailure, "TLS accept() failed")?;
     Ok(stream)
 }
 
@@ -78,7 +78,7 @@ pub async fn handshake_with_callback<S: IO>(
         Pin::new(&mut tls_stream)
             .resume_accept()
             .await
-            .explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
+            .or_err(TLSHandshakeFailure, "TLS accept() failed")?;
     }
     let extension = match tls_stream.get_ssl() {
         Some(tls_ref) => callbacks.handshake_complete_callback(tls_ref).await,
@@ -109,15 +109,23 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::listeners::tls::TlsSettings;
+    use crate::listeners::tls::{Acceptor, TlsSettings};
     use crate::listeners::TlsAccept;
+    use crate::protocols::l4::stream::Stream;
     use crate::protocols::tls::TlsRef;
+    use crate::services::listening::handshake_was_abandoned;
     use async_trait::async_trait;
+    use pingora_error::{BError, ErrorType::TLSHandshakeFailure};
     use pingora_rustls::{
-        ClientConfig, HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier, ServerName,
+        load_ca_file_into_store, ClientConfig, HandshakeSignatureValid, RootCertStore, RusTlsError,
+        ServerCertVerified, ServerCertVerifier, ServerName, TlsConnector, WebPkiClientVerifier,
     };
+    use rustls::AlertDescription;
+    use std::future::Future;
+    use std::io;
     use std::sync::Arc;
-    use tokio::io::{AsyncReadExt, DuplexStream};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
+    use tokio::net::{TcpListener, TcpStream};
 
     #[derive(Debug)]
     struct NoVerify;
@@ -165,16 +173,67 @@ mod tests {
         }
     }
 
-    async fn client_task(client: DuplexStream) {
+    /// Connect as a TLS client that trusts any server certificate and has no
+    /// client certificate of its own.
+    async fn tls_connect<S: AsyncRead + AsyncWrite + Unpin>(
+        stream: S,
+    ) -> io::Result<pingora_rustls::ClientTlsStream<S>> {
         let config = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerify))
             .with_no_client_auth();
-        let connector = pingora_rustls::TlsConnector::from(Arc::new(config));
+        let connector = TlsConnector::from(Arc::new(config));
         let server_name = ServerName::try_from("openrusty.org").unwrap();
-        let mut stream = connector.connect(server_name, client).await.unwrap();
+        connector.connect(server_name, stream).await
+    }
+
+    async fn client_task(client: DuplexStream) {
+        let mut stream = tls_connect(client).await.unwrap();
         let mut buf = [0u8; 1];
         let _ = stream.read(&mut buf).await;
+    }
+
+    fn cert_path() -> String {
+        format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn key_path() -> String {
+        format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// Accept one real TCP connection, let `client` drive the other end, and
+    /// return the error from the server side of the TLS handshake.
+    async fn server_handshake_error<F, Fut>(acceptor: Acceptor, client: F) -> BError
+    where
+        F: FnOnce(TcpStream) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(client(TcpStream::connect(addr).await.unwrap()));
+        let (server, _) = listener.accept().await.unwrap();
+        let err = acceptor
+            .tls_handshake(Stream::from(server))
+            .await
+            .expect_err("the handshake should fail");
+        client.await.unwrap();
+        err
+    }
+
+    /// The `io::Error` at the bottom of a handshake error, if the chain kept it.
+    fn io_root_cause(e: &BError) -> Option<&io::Error> {
+        e.root_cause().downcast_ref::<io::Error>()
+    }
+
+    /// The rustls error that tokio-rustls wrapped in an `InvalidData` io error.
+    fn rustls_root_cause(e: &BError) -> Option<&RusTlsError> {
+        io_root_cause(e)?.get_ref()?.downcast_ref::<RusTlsError>()
+    }
+
+    /// Write `bytes` in place of a ClientHello, then wait for the server to hang up.
+    async fn send_raw(mut stream: TcpStream, bytes: &'static [u8]) {
+        stream.write_all(bytes).await.unwrap();
+        let _ = stream.read_to_end(&mut Vec::new()).await;
     }
 
     #[tokio::test]
@@ -208,5 +267,110 @@ mod tests {
         let digest = stream.ssl_digest().unwrap();
         let cipher = digest.extension.get::<CipherName>().unwrap();
         assert!(!cipher.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handshake_eof_keeps_io_cause() {
+        // What a TCP health check looks like: connect, then hang up without a ClientHello.
+        let acceptor = TlsSettings::intermediate(&cert_path(), &key_path())
+            .unwrap()
+            .build();
+        let err = server_handshake_error(acceptor, |stream| async move { drop(stream) }).await;
+
+        assert_eq!(err.etype, TLSHandshakeFailure, "{err}");
+        let io_err = io_root_cause(&err).expect("the io::Error cause should survive");
+        assert_eq!(io_err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+        assert!(handshake_was_abandoned(&err), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_handshake_with_callback_eof_keeps_io_cause() {
+        struct NoopCallback;
+        impl TlsAccept for NoopCallback {}
+
+        let mut settings = TlsSettings::with_callbacks(Box::new(NoopCallback)).unwrap();
+        settings.set_certificate_chain_file(&cert_path()).unwrap();
+        settings.set_private_key_file(&key_path()).unwrap();
+        let err =
+            server_handshake_error(settings.build(), |stream| async move { drop(stream) }).await;
+
+        assert_eq!(err.etype, TLSHandshakeFailure, "{err}");
+        let io_err = io_root_cause(&err).expect("the io::Error cause should survive");
+        assert_eq!(io_err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+        assert!(handshake_was_abandoned(&err), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_handshake_plaintext_keeps_io_cause() {
+        // Plain HTTP sent to a TLS port.
+        let acceptor = TlsSettings::intermediate(&cert_path(), &key_path())
+            .unwrap()
+            .build();
+        let err = server_handshake_error(acceptor, |stream| {
+            send_raw(stream, b"GET / HTTP/1.1\r\nHost: openrusty.org\r\n\r\n")
+        })
+        .await;
+
+        assert_eq!(err.etype, TLSHandshakeFailure, "{err}");
+        let io_err = io_root_cause(&err).expect("the io::Error cause should survive");
+        assert_eq!(io_err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(rustls_root_cause(&err).is_some(), "{err}");
+        assert!(!handshake_was_abandoned(&err), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_handshake_alert_keeps_io_cause() {
+        // A fatal handshake_failure alert in place of a ClientHello.
+        let acceptor = TlsSettings::intermediate(&cert_path(), &key_path())
+            .unwrap()
+            .build();
+        let err = server_handshake_error(acceptor, |stream| {
+            send_raw(stream, &[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28])
+        })
+        .await;
+
+        assert_eq!(err.etype, TLSHandshakeFailure, "{err}");
+        assert!(
+            matches!(
+                rustls_root_cause(&err),
+                Some(RusTlsError::AlertReceived(
+                    AlertDescription::HandshakeFailure
+                ))
+            ),
+            "{err}"
+        );
+        assert!(!handshake_was_abandoned(&err), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_handshake_missing_client_cert_keeps_io_cause() {
+        let mut roots = RootCertStore::empty();
+        load_ca_file_into_store(cert_path(), &mut roots).unwrap();
+        let verifier = WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .unwrap();
+        let mut settings = TlsSettings::intermediate(&cert_path(), &key_path()).unwrap();
+        settings.set_client_cert_verifier(verifier);
+
+        // The client has no certificate to offer, so the server has to reject it.
+        let err = server_handshake_error(settings.build(), |stream| async move {
+            if let Ok(mut tls) = tls_connect(stream).await {
+                let _ = tls.read_to_end(&mut Vec::new()).await;
+            }
+        })
+        .await;
+
+        assert_eq!(err.etype, TLSHandshakeFailure, "{err}");
+        assert!(
+            matches!(
+                rustls_root_cause(&err),
+                Some(RusTlsError::NoCertificatesPresented)
+            ),
+            "{err}"
+        );
+        assert!(!handshake_was_abandoned(&err), "{err}");
     }
 }
