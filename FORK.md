@@ -21,9 +21,18 @@ rustls handshake-complete callback an empty
 certificate reference, unlike the boringssl and
 openssl backends.
 
+The 0.11.0 release moves the base to upstream `main`
+at 4487f7b, five commits past 0.9.0. Those commits
+make the response body and trailer filters on
+`ProxyHttp` async (every implementation has to
+follow), parameterize downstream sessions, add an
+owned HTTP test origin, and abort TLS offload tasks
+when they are dropped.
+
 ## Changes From Upstream
 
-The fork is based on upstream **0.9.0** with seven
+The fork is based on upstream `main` at 4487f7b
+(0.9.0 plus the five commits above) with seven
 functional changes:
 
 ### 1. Custom rustls `ServerConfig` support
@@ -135,7 +144,9 @@ fork infrastructure scaffolding.
 
 The fork is published to crates.io as
 `quixotic-plecostomus-*` (22 pingora crates plus the
-vendored `quixotic-plecostomus-rustls-openssl`). The name was
+vendored `quixotic-plecostomus-rustls-openssl`; the
+upstream `pingora-test-utils` crate stays unpublished
+and path-only). The name was
 chosen to avoid appearing in search results for
 "Pingora" or "Praxis", since the fork is temporary
 and not intended for external use.
@@ -146,7 +157,7 @@ only `Cargo.toml` package aliasing is needed:
 
 ```toml
 pingora-core = {
-    version = "0.10.0",
+    version = "0.11.0",
     package = "quixotic-plecostomus-core",
 }
 ```
@@ -167,9 +178,9 @@ first-class dependency with clear provenance.
 |---|---|
 | **Upstream** | https://github.com/cloudflare/pingora |
 | **Org fork** | https://github.com/praxis-proxy/pingora |
-| **Base tag** | 0.9.0 |
+| **Base** | upstream `main` at 4487f7b (0.9.0 + 5 commits) |
 | **License** | Apache 2.0 (unchanged from upstream) |
-| **crates.io** | `quixotic-plecostomus-*` v0.10.0 (pingora crates); `quixotic-plecostomus-rustls-openssl` v0.4.1 |
+| **crates.io** | `quixotic-plecostomus-*` v0.11.0 (pingora crates); `quixotic-plecostomus-rustls-openssl` v0.4.1 |
 
 [upstream]: https://github.com/cloudflare/pingora
 [rustls-openssl]: https://github.com/tofay/rustls-openssl

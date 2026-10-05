@@ -1,6 +1,6 @@
 [package]
 name = "quixotic-plecostomus-rustls"
-version = "0.10.0"
+version = "0.11.0"
 license = "Apache-2.0"
 edition = "2021"
 repository = "https://github.com/praxis-proxy/pingora"
@@ -16,7 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 log = "0.4.21"
-pingora-error = { version = "0.10.0", path = "../pingora-error", package = "quixotic-plecostomus-error" }
+pingora-error = { version = "0.11.0", path = "../pingora-error", package = "quixotic-plecostomus-error" }
 # 0.23.13 is the first rustls with the `custom-provider` feature used below.
 # No crypto provider is selected here, deliberately. This crate performs no
 # cryptography of its own: it loads PEM files, re-exports rustls types, and
