@@ -33,10 +33,11 @@ use crate::services::Service as ServiceTrait;
 
 use async_trait::async_trait;
 use log::{debug, error, info};
-use pingora_error::Result;
+use pingora_error::{Error, Result};
 use pingora_runtime::current_handle;
 use pingora_timeout::timeout;
 use std::fs::Permissions;
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -237,7 +238,16 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
                                     Ok(io) => Self::handle_event(io, app, shutdown).await,
                                     Err(e) => {
                                         // TODO: Maybe IOApp trait needs a fn to handle/filter out this error
-                                        if let Some(addr) = peer_addr {
+                                        if handshake_was_abandoned(&e) {
+                                            if let Some(addr) = peer_addr {
+                                                debug!(
+                                                    "Downstream handshake abandoned by {}: {e}",
+                                                    addr
+                                                );
+                                            } else {
+                                                debug!("Downstream handshake abandoned: {e}");
+                                            }
+                                        } else if let Some(addr) = peer_addr {
                                             error!("Downstream handshake error from {}: {e}", addr);
                                         } else {
                                             error!("Downstream handshake error: {e}");
@@ -335,5 +345,91 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
 
     fn listen_addresses(&self) -> Option<Vec<String>> {
         Some(self.listeners.addresses())
+    }
+}
+
+/// Whether a failed downstream handshake only means the client went away.
+///
+/// TCP health checks (Kubernetes probes, load balancers) and port scanners
+/// connect to a TLS listener and hang up without ever sending a ClientHello.
+/// That fails the handshake with an [`ErrorKind::UnexpectedEof`] at the bottom
+/// of the error chain, and a client that resets or aborts the connection
+/// shows up as [`ErrorKind::ConnectionReset`], [`ErrorKind::ConnectionAborted`]
+/// or [`ErrorKind::BrokenPipe`]. None of those deserve an error log line every
+/// few seconds. Anything else, such as a TLS protocol error, a received alert,
+/// or a missing client certificate, is a real failure.
+///
+/// Only the rustls backend keeps the [`std::io::Error`] as the root cause of a
+/// handshake error. The boringssl, openssl and s2n backends still flatten it
+/// into the error's context, so their TLS failures always count as real.
+///
+/// Known limitation: a client that rejects the server certificate and hangs up
+/// without sending an alert looks exactly like a health check, so it is counted
+/// as abandoned too.
+pub(crate) fn handshake_was_abandoned(e: &Error) -> bool {
+    e.root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io_err| {
+            matches!(
+                io_err.kind(),
+                ErrorKind::UnexpectedEof
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pingora_error::ErrorType::TLSHandshakeFailure;
+    use std::io;
+
+    /// A handshake error shaped the way the rustls accept path builds one.
+    fn handshake_error(kind: ErrorKind) -> Box<Error> {
+        let io_err = io::Error::new(kind, "handshake io error");
+        let inner = Error::because(TLSHandshakeFailure, "tls connect error", io_err);
+        Error::because(TLSHandshakeFailure, "TLS accept() failed", inner)
+    }
+
+    #[test]
+    fn test_client_going_away_is_abandoned() {
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+        ] {
+            assert!(handshake_was_abandoned(&handshake_error(kind)), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn test_real_failures_are_not_abandoned() {
+        // InvalidData is what tokio-rustls reports for a protocol error, a
+        // received alert, or a rejected client certificate.
+        for kind in [
+            ErrorKind::InvalidData,
+            ErrorKind::TimedOut,
+            ErrorKind::PermissionDenied,
+            ErrorKind::WriteZero,
+            ErrorKind::Other,
+        ] {
+            assert!(!handshake_was_abandoned(&handshake_error(kind)), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn test_error_without_io_cause_is_not_abandoned() {
+        // The cause flattened into the context, as the other TLS backends do.
+        let flattened = Error::explain(
+            TLSHandshakeFailure,
+            "TLS accept() failed: tls handshake eof",
+        );
+        assert!(!handshake_was_abandoned(&flattened), "{flattened}");
+
+        let not_io = Error::because(TLSHandshakeFailure, "TLS accept() failed", std::fmt::Error);
+        assert!(!handshake_was_abandoned(&not_io), "{not_io}");
     }
 }

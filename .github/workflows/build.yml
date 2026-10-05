@@ -92,6 +92,11 @@ jobs:
         if: matrix.toolchain != '1.85.0'
         run: cargo test --verbose --doc
 
+      # pingora-core's default features leave TLS out, so the steps above never build the rustls backend.
+      - name: Run cargo test (rustls)
+        if: matrix.toolchain == '1.97.1'
+        run: cargo test --verbose -p quixotic-plecostomus-core --features rustls --lib --tests
+
       - name: Run cargo clippy
         run: |
           [[ ${{ matrix.toolchain }} != 1.97.1 ]] || cargo clippy --all-targets --all -- --allow=unknown-lints --deny=warnings
