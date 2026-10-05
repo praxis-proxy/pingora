@@ -5,6 +5,7 @@ authors = ["Pingora Team at Cloudflare <pingora@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
 repository = "https://github.com/cloudflare/pingora"
+publish = false
 description = """
 Test utilities for Pingora services and libraries.
 """
