@@ -186,6 +186,11 @@ mod tests {
     use tokio::task::JoinHandle;
     use tokio::time::sleep;
 
+    fn install_provider() {
+        #[cfg(feature = "rustls")]
+        crate::test_crypto::install();
+    }
+
     async fn get_http(http: &mut Http1Session, expected_status: u16) {
         let mut req = Box::new(RequestHeader::build("GET", b"/", None).unwrap());
         req.append_header("Host", "one.one.one.one").unwrap();
@@ -199,6 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_h2() {
+        install_provider();
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         peer.options.set_http_version(2, 2);
@@ -224,6 +230,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_h1() {
+        install_provider();
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         peer.options.set_http_version(1, 1);
@@ -252,6 +259,7 @@ mod tests {
     async fn test_connect_h2_fallback_h1_reuse() {
         // this test verify that if the server doesn't support h2, the Connector will reuse the
         // h1 session instead.
+        install_provider();
 
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
@@ -285,6 +293,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_prefer_h1() {
+        install_provider();
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         peer.options.set_http_version(2, 1);

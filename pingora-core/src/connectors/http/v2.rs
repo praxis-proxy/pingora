@@ -679,6 +679,8 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "any_tls")]
     async fn test_connect_h2() {
+        #[cfg(feature = "rustls")]
+        crate::test_crypto::install();
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         peer.options.set_http_version(2, 2);
