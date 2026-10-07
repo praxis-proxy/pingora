@@ -3,7 +3,7 @@ name: Security Audit
 on:
   push:
     branches:
-      - master
+      - main
     paths:
       - "**/Cargo.toml"
   schedule:
@@ -15,19 +15,13 @@ permissions:
 jobs:
   security-audit:
     permissions:
-      checks: write # for rustsec/audit-check to create check
-      contents: read # for actions/checkout to fetch code
-      issues: write # for rustsec/audit-check to create issues
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Generate Cargo.lock
-        # https://github.com/rustsec/audit-check/issues/27
         run: cargo generate-lockfile --ignore-rust-version
 
-      - name: Audit Check
-        # https://github.com/rustsec/audit-check/issues/2
-        uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # master
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Audit dependencies
+        run: cargo install --locked cargo-audit && cargo audit
