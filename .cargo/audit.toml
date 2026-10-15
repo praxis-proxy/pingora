@@ -1,9 +1,12 @@
-# Advisories against rustls-webpki 0.101.7, pulled in transitively by
-# aws-sdk-s3-transfer-manager through the legacy rustls 0.21 chain used by
-# dial9's worker-s3 feature. No patch exists in 0.101.x; not reachable in
-# our usage because this is TLS client use only and does not parse CRLs.
+# Advisories against the legacy rustls 0.21 chain (rustls 0.21, rustls-webpki
+# 0.101.7, h2 0.3.27) that dial9 0.3's worker-s3 feature pulls in through
+# aws-sdk-s3-transfer-manager. The chain only exists when the opt-in
+# dial9-worker-s3 feature is on, and only serves its S3 trace uploads. No
+# patched release exists on these old lines; not reachable in our usage
+# because this is TLS client use only and does not parse CRLs.
 # Remove once Pingora migrates to the Dial9 release line that removed
-# aws-sdk-s3-transfer-manager.
+# aws-sdk-s3-transfer-manager (dial9 0.5, which also needs pingora-runtime's
+# direct aws-sdk-s3 dependency to drop its default features).
 
 [advisories]
 ignore = [
@@ -13,4 +16,10 @@ ignore = [
     # h2 0.3.27 is pulled in only by the optional worker-s3 dependency chain.
     # The feature is disabled by default, but users who enable it remain affected.
     "RUSTSEC-2026-0258", # h2: unbounded empty DATA frames
+    # rustls 0.21.12 is the same optional chain; the fix is only in 0.23.46+.
+    # 0346 needs a custom ClientSessionStore that Debug-formats session values,
+    # and the AWS SDK client uses rustls's built-in, redacted cache. 0349 is a
+    # downgrade from the post-quantum hybrid group, which 0.21 never offers.
+    "RUSTSEC-2026-0346", # rustls: Debug impls for client session values expose TLS secrets
+    "RUSTSEC-2026-0349", # rustls: unauthenticated ServerHello can downgrade later connections
 ]
