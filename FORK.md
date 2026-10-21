@@ -29,6 +29,10 @@ follow), parameterize downstream sessions, add an
 owned HTTP test origin, and abort TLS offload tasks
 when they are dropped.
 
+The 0.11.1 patch release fixes L4 stream construction
+with Tokio 1.54 and preserves unbuffered reads when
+configuring connection buffers.
+
 ## Changes From Upstream
 
 The fork is based on upstream `main` at 4487f7b
@@ -157,7 +161,7 @@ only `Cargo.toml` package aliasing is needed:
 
 ```toml
 pingora-core = {
-    version = "0.11.0",
+    version = "0.11.1",
     package = "quixotic-plecostomus-core",
 }
 ```
@@ -180,7 +184,7 @@ first-class dependency with clear provenance.
 | **Org fork** | https://github.com/praxis-proxy/pingora |
 | **Base** | upstream `main` at 4487f7b (0.9.0 + 5 commits) |
 | **License** | Apache 2.0 (unchanged from upstream) |
-| **crates.io** | `quixotic-plecostomus-*` v0.11.0 (pingora crates); `quixotic-plecostomus-rustls-openssl` v0.4.1 |
+| **crates.io** | `quixotic-plecostomus-*` v0.11.1 (pingora crates); `quixotic-plecostomus-rustls-openssl` v0.4.1 |
 
 [upstream]: https://github.com/cloudflare/pingora
 [rustls-openssl]: https://github.com/tofay/rustls-openssl
