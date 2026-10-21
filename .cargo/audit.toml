@@ -2,16 +2,18 @@
 # 0.101.7, h2 0.3.27) that dial9 0.3's worker-s3 feature pulls in through
 # aws-sdk-s3-transfer-manager. The chain only exists when the opt-in
 # dial9-worker-s3 feature is on, and only serves its S3 trace uploads. No
-# patched release exists on these old lines; not reachable in our usage
-# because this is TLS client use only and does not parse CRLs.
+# patched release exists on these old lines.
 # Remove once Pingora migrates to the Dial9 release line that removed
 # aws-sdk-s3-transfer-manager (dial9 0.5, which also needs pingora-runtime's
 # direct aws-sdk-s3 dependency to drop its default features).
 
 [advisories]
 ignore = [
+    # These name-constraint bugs can affect TLS clients using the legacy
+    # stack; current AWS SDK defaults use rustls 0.23 (see 0382 below).
     "RUSTSEC-2026-0098", # rustls-webpki: URI name constraints incorrectly accepted
     "RUSTSEC-2026-0099", # rustls-webpki: name constraints accepted for wildcard certs
+    # S3 clients do not parse CRLs.
     "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
     # h2 0.3.27 is pulled in only by the optional worker-s3 dependency chain.
     # The feature is disabled by default, but users who enable it remain affected.
@@ -22,4 +24,13 @@ ignore = [
     # downgrade from the post-quantum hybrid group, which 0.21 never offers.
     "RUSTSEC-2026-0346", # rustls: Debug impls for client session values expose TLS secrets
     "RUSTSEC-2026-0349", # rustls: unauthenticated ServerHello can downgrade later connections
+    # rustls-webpki 0.101.7 again; the emSign fix is only in 0.103.16+. That
+    # copy is compiled in but unused by current AWS SDK defaults: from
+    # behavior version v2026_01_12 it picks hyper 1.x on rustls 0.23, and
+    # dial9 and the transfer manager both build on BehaviorVersion::latest().
+    # A client pinned to an older behavior version and passed in through
+    # Dial9S3UploadOpts::with_client still gets the legacy client, which trusts
+    # the OS root store, so it stays exposed wherever that store still carries
+    # emSign ECC Root CA - G3.
+    "RUSTSEC-2026-0382", # rustls-webpki: distrusted emSign intermediates accepted
 ]

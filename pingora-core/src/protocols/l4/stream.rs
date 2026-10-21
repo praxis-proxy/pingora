@@ -419,6 +419,19 @@ impl L4BufferSettings {
     }
 }
 
+/// Wrap `raw` in a [`BufStream`] with the given buffer capacities.
+///
+/// A read capacity of zero means unbuffered reads, but Tokio 1.54 rejects
+/// zero-capacity readers. That case gets a one-byte reader instead,
+/// which [`Stream`] never reads through (see its `buffer_read` flag).
+fn new_buf_stream(
+    read_capacity: usize,
+    write_capacity: usize,
+    raw: RawStreamWrapper,
+) -> BufStream<RawStreamWrapper> {
+    BufStream::with_capacity(read_capacity.max(1), write_capacity, raw)
+}
+
 // NOTE: with writer buffering, users need to call flush() to make sure the data is actually
 // sent. Otherwise data could be stuck in the buffer forever or get lost when stream is closed.
 
@@ -429,6 +442,8 @@ pub struct Stream {
     stream: Option<BufStream<RawStreamWrapper>>,
     // the data put back at the front of the read buffer, in order to replay the read
     rewind_read_buf: Vec<Vec<u8>>,
+    // false when the read capacity is zero: reads then skip the placeholder reader
+    buffer_read: bool,
     buffer_write: bool,
     proxy_digest: Option<Arc<ProxyDigest>>,
     socket_digest: Option<Arc<SocketDigest>>,
@@ -526,32 +541,34 @@ impl Stream {
     }
 
     /// Set the buffer of BufStream
-    /// It is only set later because of the malloc overhead in critical accept() path
+    /// Defer allocating the full buffers until after the critical accept() path.
     pub(crate) fn set_buffer(&mut self, buffer: L4BufferSettings) {
         use std::mem;
         // Since BufStream doesn't provide an API to adjust the buf directly,
         // we take the raw stream out of it and put it in a new BufStream with the size we want
         let stream = mem::take(&mut self.stream);
         let stream = stream.map(|s| {
-            BufStream::with_capacity(
+            new_buf_stream(
                 buffer.read_capacity(),
                 buffer.write_capacity(),
                 s.into_inner(),
             )
         });
         let _ = mem::replace(&mut self.stream, stream);
+        self.buffer_read = buffer.read_capacity() > 0;
     }
 }
 
 impl From<TcpStream> for Stream {
     fn from(s: TcpStream) -> Self {
         Stream {
-            stream: Some(BufStream::with_capacity(
+            stream: Some(new_buf_stream(
                 0,
                 0,
                 RawStreamWrapper::new(RawStream::Tcp(s)),
             )),
             rewind_read_buf: Vec::new(),
+            buffer_read: false,
             buffer_write: true,
             established_ts: SystemTime::now(),
             establishment_duration: None,
@@ -569,12 +586,13 @@ impl From<TcpStream> for Stream {
 impl From<virt::VirtualSocketStream> for Stream {
     fn from(s: virt::VirtualSocketStream) -> Self {
         Stream {
-            stream: Some(BufStream::with_capacity(
+            stream: Some(new_buf_stream(
                 0,
                 0,
                 RawStreamWrapper::new(RawStream::Virtual(s)),
             )),
             rewind_read_buf: Vec::new(),
+            buffer_read: false,
             buffer_write: true,
             established_ts: SystemTime::now(),
             establishment_duration: None,
@@ -593,12 +611,13 @@ impl From<virt::VirtualSocketStream> for Stream {
 impl From<UnixStream> for Stream {
     fn from(s: UnixStream) -> Self {
         Stream {
-            stream: Some(BufStream::with_capacity(
+            stream: Some(new_buf_stream(
                 0,
                 0,
                 RawStreamWrapper::new(RawStream::Unix(s)),
             )),
             rewind_read_buf: Vec::new(),
+            buffer_read: false,
             buffer_write: true,
             established_ts: SystemTime::now(),
             establishment_duration: None,
@@ -758,8 +777,10 @@ impl AsyncRead for Stream {
                 self.rewind_read_buf.push(remaining_buf);
             }
             result
-        } else {
+        } else if self.buffer_read {
             Pin::new(&mut self.stream_mut()).poll_read(cx, buf)
+        } else {
+            Pin::new(&mut self.stream_mut().get_mut()).poll_read(cx, buf)
         };
         self.read_pending_time.poll_time(&result);
         self.rx_ts = self.stream().get_ref().rx_ts;
@@ -1045,5 +1066,77 @@ mod tests {
         let mut buffer = vec![];
         stream.read_to_end(&mut buffer).await.unwrap();
         assert_eq!(buffer, message[2..]);
+    }
+
+    // Tokio 1.54 panics on a zero-capacity reader, which every new stream and
+    // L4BufferSettings::unbuffered() ask for.
+    #[tokio::test]
+    async fn test_stream_round_trip_with_buffer_settings() {
+        for settings in [
+            None,
+            Some(L4BufferSettings::unbuffered()),
+            Some(L4BufferSettings::default()),
+            Some(L4BufferSettings::default().read(0)),
+            Some(L4BufferSettings::default().write(0)),
+            Some(L4BufferSettings::new(1, 1)),
+        ] {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let peer = tokio::spawn(async move {
+                    let (mut peer, _) = listener.accept().await.unwrap();
+                    let mut buf = [0u8; 11];
+                    peer.read_exact(&mut buf).await.unwrap();
+                    peer.write_all(&buf).await.unwrap();
+                });
+
+                let mut stream: Stream = TcpStream::connect(addr).await.unwrap().into();
+                if let Some(settings) = settings {
+                    stream.set_buffer(settings);
+                }
+                stream.write_all(b"hello world").await.unwrap();
+                stream.flush().await.unwrap();
+
+                let mut buf = [0u8; 11];
+                stream.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"hello world", "{settings:?}");
+                peer.await.unwrap();
+            })
+            .await
+            .expect("stream round trip timed out");
+        }
+    }
+
+    // Unbuffered reads must leave nothing in the placeholder reader, since
+    // set_buffer drops it along with the old BufStream.
+    #[tokio::test]
+    async fn test_unbuffered_read_holds_nothing_back() {
+        for settings in [None, Some(L4BufferSettings::unbuffered())] {
+            for read_size in [0, 1] {
+                let (socket, mut peer) = UnixStream::pair().unwrap();
+                let mut stream: Stream = socket.into();
+                if let Some(settings) = settings {
+                    stream.set_buffer(settings);
+                }
+                // Queue data before the read so an accidental read-ahead
+                // would consume it, then close the peer to expose lost bytes.
+                let message = b"hello world";
+                peer.write_all(message).await.unwrap();
+                drop(peer);
+
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let mut prefix = vec![0u8; read_size];
+                    assert_eq!(stream.read(&mut prefix).await.unwrap(), read_size);
+                    assert_eq!(prefix, message[..read_size]);
+                    stream.set_buffer(L4BufferSettings::default());
+
+                    let mut rest = Vec::new();
+                    stream.read_to_end(&mut rest).await.unwrap();
+                    assert_eq!(rest, message[read_size..], "{settings:?}, {read_size}");
+                })
+                .await
+                .expect("unbuffered read timed out");
+            }
+        }
     }
 }
