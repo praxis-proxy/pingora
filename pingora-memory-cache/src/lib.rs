@@ -323,6 +323,30 @@ mod tests {
         cache.put(&1, 2, None);
         cache.put(&2, 4, None);
         cache.put(&3, 6, None);
+
+        // TinyLFU's randomized frequency sketch can reject the new entry
+        // instead of evicting the oldest one. Either way, capacity is two.
+        let mut hits = 0;
+        for key in 1..=3 {
+            let (res, status) = cache.get(&key);
+            if let Some(value) = res {
+                assert_eq!(value, key * 2);
+                assert_eq!(status, CacheStatus::Hit);
+                hits += 1;
+            } else {
+                assert_eq!(status, CacheStatus::Miss);
+            }
+        }
+        assert_eq!(hits, 2);
+    }
+
+    #[test]
+    fn test_force_put_eviction() {
+        let cache: MemoryCache<i32, i32> = MemoryCache::new(2);
+        cache.put(&1, 2, None);
+        cache.put(&2, 4, None);
+        // Forced admission bypasses TinyLFU, so the oldest unread entry is evicted.
+        cache.force_put(&3, 6, None);
         let (res, hit) = cache.get(&1);
         assert_eq!(res, None);
         assert_eq!(hit, CacheStatus::Miss);
