@@ -5482,27 +5482,29 @@ mod test_cache {
         init();
         let url = "http://127.0.0.1:6148/unique/test_cache_max_file_size_range_100/now";
 
+        // Distinguish origin requests by ID: ngx.now() can be identical for
+        // separate requests served within the same millisecond.
         let res = send_max_file_size_req(url, 100, Some((1, 4))).await;
         assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
         let headers = res.headers();
-        let epoch1 = headers["x-epoch"].clone();
+        let request_id1 = headers["x-origin-request-id"].clone();
         assert_eq!(headers["x-cache-status"], "miss");
         assert_eq!(res.text().await.unwrap(), "ello");
 
         let res = send_max_file_size_req(url, 100, Some((1, 4))).await;
         assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
         let headers = res.headers();
-        let epoch2 = headers["x-epoch"].clone();
+        let request_id2 = headers["x-origin-request-id"].clone();
         assert_eq!(headers["x-cache-status"], "hit");
         assert_eq!(res.text().await.unwrap(), "ello");
-        assert_eq!(epoch1, epoch2);
+        assert_eq!(request_id1, request_id2);
 
         // disable downstream ranging on max file size exceeded
         let url = "http://127.0.0.1:6148/unique/test_cache_max_file_size_range_1/now";
         let res = send_max_file_size_req(url, 1, Some((1, 4))).await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
-        let epoch1 = headers["x-epoch"].clone();
+        let request_id1 = headers["x-origin-request-id"].clone();
         assert_eq!(headers["x-cache-status"], "no-cache");
         assert_eq!(res.text().await.unwrap(), "hello world");
 
@@ -5510,10 +5512,10 @@ mod test_cache {
         let res = send_max_file_size_req(url, 1, Some((1, 4))).await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
-        let epoch2 = headers["x-epoch"].clone();
+        let request_id2 = headers["x-origin-request-id"].clone();
         assert_eq!(headers["x-cache-status"], "no-cache");
         assert_eq!(res.text().await.unwrap(), "hello world");
-        assert!(epoch1 != epoch2);
+        assert_ne!(request_id1, request_id2);
     }
 
     #[tokio::test]
