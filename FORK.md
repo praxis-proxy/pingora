@@ -33,6 +33,13 @@ The 0.11.1 patch release fixes L4 stream construction
 with Tokio 1.54 and preserves unbuffered reads when
 configuring connection buffers.
 
+The 0.11.2 patch release updates header compression
+dependencies to `zstd` 0.14 and `zstd-safe` 8 and
+raises the fork's minimum supported Rust version to
+1.88. It also aligns CI with that minimum and fixes
+cache tests that assumed unique timestamps or a
+deterministic TinyLFU admission order.
+
 ## Changes From Upstream
 
 The fork is based on upstream `main` at 4487f7b
@@ -161,7 +168,7 @@ only `Cargo.toml` package aliasing is needed:
 
 ```toml
 pingora-core = {
-    version = "0.11.1",
+    version = "0.11.2",
     package = "quixotic-plecostomus-core",
 }
 ```
@@ -184,7 +191,7 @@ first-class dependency with clear provenance.
 | **Org fork** | https://github.com/praxis-proxy/pingora |
 | **Base** | upstream `main` at 4487f7b (0.9.0 + 5 commits) |
 | **License** | Apache 2.0 (unchanged from upstream) |
-| **crates.io** | `quixotic-plecostomus-*` v0.11.1 (pingora crates); `quixotic-plecostomus-rustls-openssl` v0.4.1 |
+| **crates.io** | `quixotic-plecostomus-*` v0.11.2 (pingora crates); `quixotic-plecostomus-rustls-openssl` v0.4.1 |
 
 [upstream]: https://github.com/cloudflare/pingora
 [rustls-openssl]: https://github.com/tofay/rustls-openssl
