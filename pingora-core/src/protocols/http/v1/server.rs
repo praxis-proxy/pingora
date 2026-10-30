@@ -701,6 +701,14 @@ impl HttpSession {
         self.upgraded
     }
 
+    /// Whether this response establishes a CONNECT tunnel: the request was
+    /// `CONNECT` and the response status is 2xx (RFC 9110 section 9.3.6:
+    /// any 2xx response without `Content-Transfer-Encoding` means the
+    /// tunnel is established).
+    fn is_connect_tunnel_resp(&self, header: &ResponseHeader) -> bool {
+        self.get_method() == Some(&Method::CONNECT) && header.status.is_success()
+    }
+
     fn set_keepalive(&mut self, seconds: Option<u64>) {
         match seconds {
             Some(sec) => {
@@ -843,6 +851,14 @@ impl HttpSession {
             self.set_keepalive(None);
         }
 
+        // A 2xx response to CONNECT establishes a tunnel; the connection
+        // must not be reused after the tunnel ends. Set this before the
+        // Connection header value is chosen below so the response is sent
+        // with `Connection: close`.
+        if self.is_connect_tunnel_resp(header) {
+            self.set_keepalive(None);
+        }
+
         // no need to add these headers to 1xx responses
         if !header.status.is_informational() && self.update_resp_headers {
             /* update headers */
@@ -865,8 +881,21 @@ impl HttpSession {
         // Allow informational header (excluding 101) to pass through without affecting the state
         // of the request
         if header.status == 101 || !header.status.is_informational() {
-            // reset request body to done for incomplete upgrade handshakes
-            if let Some(upgrade_ok) = self.is_upgrade(header) {
+            if self.is_connect_tunnel_resp(header) {
+                debug!("ok connect tunnel");
+                self.upgraded = true;
+                // Everything after the CONNECT head is raw tunnel data, not
+                // framed body (RFC 9110 section 9.3.6). Mirror the upgrade
+                // handshake so the reader serves any pipelined preread
+                // bytes first, then passes through until the close.
+                if self.body_reader.need_init() {
+                    self.init_body_reader();
+                } else {
+                    // already initialized as a framed (empty) body:
+                    // reinterpret the rest of the stream as a tunnel
+                    self.body_reader.convert_to_close_delimited();
+                }
+            } else if let Some(upgrade_ok) = self.is_upgrade(header) {
                 if upgrade_ok {
                     debug!("ok upgrade handshake");
                     // For ws we use HTTP1_0 do_read_body_until_closed
@@ -942,7 +971,7 @@ impl HttpSession {
             return;
         }
 
-        if self.is_upgrade(header) == Some(true) {
+        if self.is_upgrade(header) == Some(true) || self.is_connect_tunnel_resp(header) {
             self.body_writer.init_close_delimited();
         } else {
             init_body_writer_comm(&mut self.body_writer, &header.headers);
@@ -2958,6 +2987,111 @@ mod tests_stream {
         http_stream.read_request().await.unwrap();
         assert_eq!(&b"pingora.org:443"[..], http_stream.get_path());
         assert_eq!(Some(&Method::CONNECT), http_stream.get_method());
+    }
+
+    #[tokio::test]
+    async fn connect_tunnel_resp_converts_session_to_tunnel() {
+        init_log();
+        // RFC 9110 §9.3.6: any 2xx to CONNECT means the tunnel is established;
+        // everything after the head is raw tunnel data. Bytes the client
+        // pipelined behind the CONNECT head must be served first.
+        let input = b"CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\n\r\n";
+        let pipelined = b"\x16\x03\x01tunnel";
+        let wire = [input.as_slice(), pipelined.as_slice()].concat();
+        let write_expected = format!(
+            "HTTP/1.1 200 OK\r\nDate: {}\r\nConnection: close\r\n\r\n",
+            date::get_cached_date().to_str().unwrap(),
+        );
+        let mock_io = Builder::new()
+            .read(&wire[..])
+            .write(write_expected.as_bytes())
+            .read(b"more tunnel data")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert_eq!(Some(&Method::CONNECT), http_stream.get_method());
+        assert!(!http_stream.was_upgraded());
+
+        let response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+
+        // the session is now a raw tunnel
+        assert!(http_stream.was_upgraded());
+        assert_eq!(
+            http_stream.body_reader.body_state,
+            ParseState::UntilClose(0),
+            "body reader should be close-delimited after a 2xx to CONNECT"
+        );
+        // pipelined bytes that arrived with the head are served first
+        let buf = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(buf, pipelined.as_slice());
+        let buf = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(buf, &b"more tunnel data"[..]);
+        // EOF ends the tunnel
+        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
+        assert!(http_stream.is_body_done());
+    }
+
+    #[tokio::test]
+    async fn connect_tunnel_resp_after_body_reader_initialized() {
+        init_log();
+        // If the (empty, framed) request body was inspected before the 2xx
+        // was written — e.g. via is_body_done() — the reader must still
+        // convert to tunnel mode and adopt the pipelined overread bytes.
+        let input = b"CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\n\r\n";
+        let pipelined = b"tunnel bytes";
+        let wire = [input.as_slice(), pipelined.as_slice()].concat();
+        let mock_io = Builder::new()
+            .read(&wire[..])
+            .write(b"HTTP/1.1 200 OK\r\n\r\n")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+        http_stream.read_request().await.unwrap();
+        // force the framed CL(0) body reader to initialize
+        assert!(http_stream.is_body_done());
+
+        let response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+
+        assert!(http_stream.was_upgraded());
+        let buf = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(buf, pipelined.as_slice());
+        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
+        assert!(http_stream.is_body_done());
+    }
+
+    #[tokio::test]
+    async fn connect_resp_non_success_keeps_framed_session() {
+        init_log();
+        // A non-2xx response to CONNECT denies the tunnel: no session
+        // conversion, the exchange stays an ordinary request/response.
+        let input = b"CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(input)
+            .write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+        http_stream.read_request().await.unwrap();
+
+        let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, Some(0)).unwrap();
+        response.append_header(CONTENT_LENGTH, "0").unwrap();
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+
+        assert!(!http_stream.was_upgraded());
+        // the empty request body is done; nothing switched to tunnel mode
+        assert!(http_stream.is_body_done());
+        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
     }
 
     #[test]
