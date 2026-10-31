@@ -778,6 +778,16 @@ where
                 {
                     *seen_upgraded = true;
                 }
+                // A 2xx response to CONNECT establishes a tunnel (RFC 9110
+                // section 9.3.6): every task after this header is raw tunnel
+                // data. Marking it here (rather than relying on
+                // `was_upgraded()`, which flips only once the head is written)
+                // keeps header and body tasks in one batch consistent.
+                if self.downstream_session.req_header().method == Method::CONNECT
+                    && resp.status.is_success()
+                {
+                    *seen_upgraded = true;
+                }
             }
             HttpTask::Body(data, end) => {
                 if *seen_upgraded {
@@ -2497,6 +2507,41 @@ mod tests {
         assert_eq!(err.etype(), &InvalidHTTPHeader);
         assert_eq!(err.esource(), &ErrorSource::Internal);
         assert!(written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_response_tasks_accepts_tunnel_tasks_after_connect_2xx() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut session = new_request_session(
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+            written.clone(),
+        )
+        .await;
+
+        // A 2xx to CONNECT establishes a tunnel (RFC 9110 section 9.3.6).
+        // Header and tunnel body can arrive in one batch: the header marks
+        // the tunnel before the head is written, so the body task must pass
+        // the filter instead of being rejected as a task after an upgrade.
+        session
+            .write_response_tasks(vec![
+                HttpTask::Header(Box::new(ResponseHeader::build(200, None).unwrap()), false),
+                HttpTask::UpgradedBody(Some(Bytes::from_static(b"ok")), false),
+            ])
+            .await
+            .unwrap();
+
+        assert!(session.was_upgraded());
+        let out = written.lock().unwrap().clone();
+        assert!(
+            out.starts_with(b"HTTP/1.1 200"),
+            "{:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            out.ends_with(b"ok"),
+            "tunnel bytes must be written unframed: {:?}",
+            String::from_utf8_lossy(&out)
+        );
     }
 
     #[tokio::test]

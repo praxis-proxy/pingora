@@ -702,9 +702,10 @@ impl HttpSession {
     }
 
     /// Whether this response establishes a CONNECT tunnel: the request was
-    /// `CONNECT` and the response status is 2xx (RFC 9110 section 9.3.6:
-    /// any 2xx response without `Content-Transfer-Encoding` means the
-    /// tunnel is established).
+    /// `CONNECT` and the response status is 2xx. RFC 9110 section 9.3.6:
+    /// "Any 2xx (Successful) response indicates that the sender (and all
+    /// inbound proxies) will switch to tunnel mode immediately after the
+    /// response header section."
     fn is_connect_tunnel_resp(&self, header: &ResponseHeader) -> bool {
         self.get_method() == Some(&Method::CONNECT) && header.status.is_success()
     }
@@ -956,6 +957,14 @@ impl HttpSession {
 
     fn init_body_writer(&mut self, header: &ResponseHeader) {
         use http::StatusCode;
+        // A 2xx response to CONNECT establishes a tunnel, so the writer must
+        // be close-delimited even for statuses that are otherwise bodyless,
+        // like 204: everything written after the head is raw tunnel data
+        // (RFC 9110 section 9.3.6).
+        if self.is_connect_tunnel_resp(header) {
+            self.body_writer.init_close_delimited();
+            return;
+        }
         /* the following responses don't have body 204, 304, and HEAD */
         if matches!(
             header.status,
@@ -971,7 +980,7 @@ impl HttpSession {
             return;
         }
 
-        if self.is_upgrade(header) == Some(true) || self.is_connect_tunnel_resp(header) {
+        if self.is_upgrade(header) == Some(true) {
             self.body_writer.init_close_delimited();
         } else {
             init_body_writer_comm(&mut self.body_writer, &header.headers);
@@ -3092,6 +3101,38 @@ mod tests_stream {
         // the empty request body is done; nothing switched to tunnel mode
         assert!(http_stream.is_body_done());
         assert!(http_stream.read_body_bytes().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn connect_204_resp_writes_tunnel_mode() {
+        init_log();
+        // 204 is 2xx: the tunnel is established (RFC 9110 §9.3.6). The writer
+        // must be close-delimited, not CL(0), or tunnel bytes written after
+        // the head would be dropped.
+        let input = b"CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(input)
+            .write(b"HTTP/1.1 204 No Content\r\n\r\n")
+            .write(b"tunnel bytes")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+        http_stream.read_request().await.unwrap();
+
+        let response = ResponseHeader::build(StatusCode::NO_CONTENT, None).unwrap();
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+
+        assert!(http_stream.was_upgraded());
+        assert_eq!(
+            http_stream.body_writer.body_mode,
+            BodyMode::UntilClose(0),
+            "204 to CONNECT must write the rest of the connection as tunnel data"
+        );
+        // tunnel bytes written downstream pass through unframed
+        http_stream.write_body(b"tunnel bytes").await.unwrap();
     }
 
     #[test]
