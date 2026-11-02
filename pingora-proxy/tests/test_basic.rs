@@ -956,6 +956,77 @@ async fn read_h1_head(stream: &mut TcpStream) -> String {
     String::from_utf8_lossy(&head).into_owned()
 }
 
+/// Proxy a CONNECT tunnel through an upstream that answers with a bare 2xx (no
+/// framing headers, as real proxies do) and then echoes what it receives.
+/// The client sends only after it reads the 2xx, the same as a TLS client,
+/// so the test covers both tunnel directions and the flush of the head.
+async fn connect_tunnel_round_trip(extra_header: &str) {
+    use std::time::Duration;
+    init_proxy().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_h1_head(&mut socket).await;
+        socket
+            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            socket.write_all(&buf[..n]).await.unwrap();
+        }
+    });
+
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    let request = format!(
+        "CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\nX-Port: {}\r\n{extra_header}\r\n",
+        upstream_addr.port()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let deadline = Duration::from_secs(5);
+    let head = tokio::time::timeout(deadline, read_h1_head(&mut stream))
+        .await
+        .expect("CONNECT 2xx head must be flushed before any tunnel data");
+    let status_line = head.lines().next().unwrap_or("");
+    assert!(status_line.contains(" 200 "), "{status_line}");
+    let head_lower = head.to_ascii_lowercase();
+    // RFC 9110 section 9.3.6: no framing headers on a 2xx response to CONNECT
+    assert!(!head_lower.contains("transfer-encoding"), "{head}");
+    assert!(!head_lower.contains("content-length"), "{head}");
+    let (_, after_head) = head.split_once("\r\n\r\n").unwrap();
+    assert!(
+        after_head.is_empty(),
+        "unexpected bytes after head: {after_head:?}"
+    );
+
+    // client-to-origin and back: raw bytes, no chunked framing
+    let payload = b"\x16\x03\x01 client hello";
+    stream.write_all(payload).await.unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    tokio::time::timeout(deadline, stream.read_exact(&mut echoed))
+        .await
+        .expect("tunnel bytes must round-trip")
+        .unwrap();
+    assert_eq!(echoed, payload);
+}
+
+#[tokio::test]
+async fn test_connect_proxying_tunnel_round_trip_h1() {
+    connect_tunnel_round_trip("").await;
+}
+
+#[tokio::test]
+async fn test_connect_proxying_tunnel_round_trip_h1_proxy_tasks() {
+    connect_tunnel_round_trip("X-Proxy-Tasks-Enabled: 1\r\n").await;
+}
+
 #[tokio::test]
 async fn test_absolute_form_request_target_h1() {
     init();

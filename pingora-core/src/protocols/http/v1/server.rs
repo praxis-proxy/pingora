@@ -706,7 +706,7 @@ impl HttpSession {
     /// "Any 2xx (Successful) response indicates that the sender (and all
     /// inbound proxies) will switch to tunnel mode immediately after the
     /// response header section."
-    fn is_connect_tunnel_resp(&self, header: &ResponseHeader) -> bool {
+    pub fn is_connect_tunnel_resp(&self, header: &ResponseHeader) -> bool {
         self.get_method() == Some(&Method::CONNECT) && header.status.is_success()
     }
 
@@ -857,6 +857,15 @@ impl HttpSession {
         // Connection header value is chosen below so the response is sent
         // with `Connection: close`.
         if self.is_connect_tunnel_resp(header) {
+            // RFC 9110 section 9.3.6: "A server MUST NOT send any
+            // Transfer-Encoding or Content-Length header fields in a 2xx
+            // (Successful) response to CONNECT." A proxied upstream response
+            // can carry either, and the proxy adds `Transfer-Encoding: chunked`
+            // to responses without framing. Removing Content-Length also means
+            // the head is flushed below: the close-delimited tunnel writer
+            // never reports finished(), so nothing else would flush it.
+            header.remove_header(&TRANSFER_ENCODING);
+            header.remove_header(&CONTENT_LENGTH);
             self.set_keepalive(None);
         }
 
@@ -3135,6 +3144,81 @@ mod tests_stream {
         http_stream.write_body(b"tunnel bytes").await.unwrap();
     }
 
+    #[rstest]
+    #[case::content_length(CONTENT_LENGTH, "0")]
+    #[case::transfer_encoding(TRANSFER_ENCODING, "chunked")]
+    #[tokio::test]
+    async fn connect_tunnel_resp_strips_framing_headers(
+        #[case] name: http::header::HeaderName,
+        #[case] value: &'static str,
+    ) {
+        init_log();
+        // RFC 9110 §9.3.6: "A server MUST NOT send any Transfer-Encoding or
+        // Content-Length header fields in a 2xx (Successful) response to
+        // CONNECT." A proxied 2xx can carry either; the head must not.
+        let input = b"CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(input)
+            .write(b"HTTP/1.1 200 OK\r\n\r\n")
+            .write(b"tunnel bytes")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+        http_stream.read_request().await.unwrap();
+
+        let mut response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        response.insert_header(name, value).unwrap();
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+
+        assert!(http_stream.was_upgraded());
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(0));
+        // tunnel bytes pass through unframed: no chunk-size line
+        http_stream.write_body(b"tunnel bytes").await.unwrap();
+    }
+
+    #[rstest]
+    #[case::content_length(Some("0"))]
+    #[case::no_content_length(None)]
+    #[tokio::test]
+    async fn connect_tunnel_resp_head_is_flushed(#[case] content_length: Option<&str>) {
+        use crate::protocols::http::v1::test_util::FlushTrackingMock;
+        init_log();
+        // The close-delimited tunnel writer never reports finished(), so the
+        // head must be flushed on its own. Otherwise it sits in the write
+        // buffer: a TLS client waits for the 2xx before it sends a
+        // ClientHello, while the origin waits for the ClientHello.
+        let input = b"CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(input)
+            .write(b"HTTP/1.1 200 OK\r\n\r\n")
+            .build();
+        let (flush_mock, flush_count) = FlushTrackingMock::new(mock_io);
+        let mut http_stream = HttpSession::new(Box::new(flush_mock));
+        http_stream.update_resp_headers = false;
+        http_stream.read_request().await.unwrap();
+
+        let mut response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        if let Some(cl) = content_length {
+            response.insert_header(CONTENT_LENGTH, cl).unwrap();
+        }
+        let flush_before = FlushTrackingMock::flush_count(&flush_count);
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+        let flush_after = FlushTrackingMock::flush_count(&flush_count);
+
+        assert!(http_stream.was_upgraded());
+        assert!(
+            flush_after > flush_before,
+            "CONNECT 2xx head must be flushed. Got flush_before={flush_before}, \
+             flush_after={flush_after}"
+        );
+    }
+
     #[test]
     fn escape_illegal() {
         init_log();
@@ -3875,6 +3959,40 @@ mod test_proxy_tasks {
             "Should flush after writing 204 response header with Content-Length \
              (body_writer.finished() is true). Got flush_before={flush_before}, \
              flush_after={flush_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_2xx_with_content_length_flushes() {
+        init_log();
+
+        // A 2xx to CONNECT is a tunnel: Content-Length is stripped (RFC 9110
+        // section 9.3.6) and the close-delimited writer never reports
+        // finished(), so the head must still be flushed.
+        let request = b"CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\n\r\n";
+        let expected_header = b"HTTP/1.1 200 OK\r\n\r\n";
+
+        let mock_io = Builder::new().read(request).write(expected_header).build();
+        let (flush_mock, flush_count) = FlushTrackingMock::new(mock_io);
+        let mut http_stream = HttpSession::new(Box::new(flush_mock));
+        http_stream.update_resp_headers = false;
+
+        http_stream.read_request().await.unwrap();
+
+        let mut header = ResponseHeader::build(StatusCode::OK, Some(1)).unwrap();
+        header.insert_header("Content-Length", "0").unwrap();
+        http_stream.send_proxy_task(HttpTask::Header(Box::new(header), false));
+
+        let flush_before = FlushTrackingMock::flush_count(&flush_count);
+        let end_stream = http_stream.write_proxy_tasks().await.unwrap();
+        let flush_after = FlushTrackingMock::flush_count(&flush_count);
+
+        assert!(!end_stream, "CONNECT tunnel stays open after the head");
+        assert!(http_stream.was_upgraded());
+        assert!(
+            flush_after > flush_before,
+            "Should flush after writing CONNECT 2xx response header. \
+             Got flush_before={flush_before}, flush_after={flush_after}"
         );
     }
 

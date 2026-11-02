@@ -779,13 +779,13 @@ where
                     *seen_upgraded = true;
                 }
                 // A 2xx response to CONNECT establishes a tunnel (RFC 9110
-                // section 9.3.6): every task after this header is raw tunnel
-                // data. Marking it here (rather than relying on
-                // `was_upgraded()`, which flips only once the head is written)
-                // keeps header and body tasks in one batch consistent.
-                if self.downstream_session.req_header().method == Method::CONNECT
-                    && resp.status.is_success()
-                {
+                // section 9.3.6): on an HTTP/1.x downstream every task after
+                // this header is raw tunnel data. Marking it here (rather than
+                // relying on `was_upgraded()`, which flips only once the head
+                // is written) keeps header and body tasks in one batch
+                // consistent. Ask the session so this matches what
+                // `was_upgraded()` becomes; an HTTP/2 tunnel stays framed.
+                if self.downstream_session.is_connect_tunnel_resp(resp) {
                     *seen_upgraded = true;
                 }
             }
@@ -2522,9 +2522,14 @@ mod tests {
         // Header and tunnel body can arrive in one batch: the header marks
         // the tunnel before the head is written, so the body task must pass
         // the filter instead of being rejected as a task after an upgrade.
+        // The h1 response filter adds `Transfer-Encoding: chunked` to a
+        // response without framing; the tunnel head must not carry it.
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header(header::TRANSFER_ENCODING, "chunked")
+            .unwrap();
         session
             .write_response_tasks(vec![
-                HttpTask::Header(Box::new(ResponseHeader::build(200, None).unwrap()), false),
+                HttpTask::Header(Box::new(resp), false),
                 HttpTask::UpgradedBody(Some(Bytes::from_static(b"ok")), false),
             ])
             .await
@@ -2537,11 +2542,80 @@ mod tests {
             "{:?}",
             String::from_utf8_lossy(&out)
         );
+        let head_end = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&out[..head_end]).to_ascii_lowercase();
+        assert!(
+            !head.contains("transfer-encoding") && !head.contains("content-length"),
+            "tunnel head must not carry framing headers: {head:?}"
+        );
         assert!(
             out.ends_with(b"ok"),
             "tunnel bytes must be written unframed: {:?}",
             String::from_utf8_lossy(&out)
         );
+    }
+
+    #[tokio::test]
+    async fn write_response_tasks_accepts_framed_body_after_h2_connect_2xx() {
+        use pingora_core::protocols::http::v2::server::{
+            handshake, H2Accept, HttpSession as SessionV2,
+        };
+        use pingora_core::protocols::Digest;
+
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let client = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client_io).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut h2 = h2.ready().await.unwrap();
+            let request = http::Request::builder()
+                .method(Method::CONNECT)
+                .uri("example.com:443")
+                .body(())
+                .unwrap();
+            let (response, _req_body) = h2.send_request(request, false).unwrap();
+            let (head, mut body) = response.await.unwrap().into_parts();
+            let data = body.data().await.unwrap().unwrap();
+            (head.status, data)
+        });
+
+        let mut connection = handshake(Box::new(server_io), None).await.unwrap();
+        let Some(H2Accept::Session(h2_session)) =
+            SessionV2::from_h2_conn(&mut connection, Arc::new(Digest::default()))
+                .await
+                .unwrap()
+        else {
+            panic!("expected an accepted h2 CONNECT stream");
+        };
+        tokio::spawn(async move {
+            // drive the connection so the response frames are sent
+            let _ = connection.accept().await;
+        });
+        let mut session = Session::new(
+            Box::new(HttpSession::new_http2(h2_session)),
+            &HttpModules::new(),
+            #[cfg(feature = "upstream_modules")]
+            &HttpModules::new(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(session.req_header().method, Method::CONNECT);
+
+        // An HTTP/2 CONNECT tunnel stays framed in DATA frames, so the 2xx
+        // must not mark the task stream as upgraded: tunnel bytes from an h2
+        // upstream arrive as ordinary body tasks.
+        session
+            .write_response_tasks(vec![
+                HttpTask::Header(Box::new(ResponseHeader::build(200, None).unwrap()), false),
+                HttpTask::Body(Some(Bytes::from_static(b"tunnel")), false),
+            ])
+            .await
+            .unwrap();
+
+        assert!(!session.was_upgraded());
+        let (status, data) = client.await.unwrap();
+        assert_eq!(status, http::StatusCode::OK);
+        assert_eq!(data, &b"tunnel"[..]);
     }
 
     #[tokio::test]

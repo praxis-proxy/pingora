@@ -839,6 +839,18 @@ where
         }
     }
 
+    /// Return whether this response establishes a CONNECT tunnel that switches
+    /// this session to tunnel mode, as a successful upgrade does.
+    ///
+    /// Only HTTP/1.x sessions switch: an HTTP/2 CONNECT tunnel stays framed in
+    /// DATA frames, so this is always `false` for the other session types.
+    pub fn is_connect_tunnel_resp(&self, header: &ResponseHeader) -> bool {
+        match self {
+            Self::H1(s) => s.is_connect_tunnel_resp(header),
+            Self::H2(_) | Self::Subrequest(_) | Self::Custom(_) => false,
+        }
+    }
+
     /// Whether this session was fully upgraded (completed Upgrade handshake).
     pub fn was_upgraded(&self) -> bool {
         match self {
