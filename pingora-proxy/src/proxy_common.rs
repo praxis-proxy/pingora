@@ -393,6 +393,19 @@ pub(crate) fn finalize_h1_upstream_request_framing(
     Ok(())
 }
 
+/// Whether a response to `req` carries no message body, so the proxy must not
+/// add `Transfer-Encoding: chunked` to it.
+///
+/// HEAD responses and 204/304 have no body. Neither does a 2xx to CONNECT
+/// (RFC 9110 section 9.3.6): the connection becomes a tunnel after the header
+/// section, and "a server MUST NOT send any Transfer-Encoding or Content-Length
+/// header fields" in that response.
+pub(crate) fn response_has_no_body(req: &RequestHeader, status: http::StatusCode) -> bool {
+    req.method == http::Method::HEAD
+        || matches!(status.as_u16(), 204 | 304)
+        || (req.method == http::Method::CONNECT && status.is_success())
+}
+
 /// Remove downstream connection-nominated fields before an HTTP/2 conversion.
 pub(crate) fn sanitize_h2_upstream_request(
     req: &mut RequestHeader,

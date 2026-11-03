@@ -946,8 +946,7 @@ where
                 /* Convert HTTP 1.0 style response to chunked encoding so that we don't
                  * have to close the downstream connection */
                 // these status codes / method cannot have body, so no need to add chunked encoding
-                let no_body = session.req_header().method == http::method::Method::HEAD
-                    || matches!(header.status.as_u16(), 204 | 304);
+                let no_body = response_has_no_body(session.req_header(), header.status);
                 if !no_body
                     && !header.status.is_informational()
                     && header
@@ -1200,6 +1199,97 @@ mod tests {
             response.set_status(http::StatusCode::SWITCHING_PROTOCOLS)?;
             response.set_version(Version::HTTP_11);
             Ok(())
+        }
+    }
+
+    /// A `ProxyHttp` whose filters leave the response unchanged.
+    struct PassThrough;
+
+    #[async_trait]
+    impl ProxyHttp for PassThrough {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("test calls h1_response_filter directly")
+        }
+    }
+
+    async fn request_session(request: &[u8]) -> Session {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(request)
+            .await
+            .expect("test request should be written");
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("test request should parse");
+        session
+    }
+
+    /// Run a header without framing headers, not ending the stream, through
+    /// `h1_response_filter` for `request`.
+    async fn filtered_unframed_response(request: &[u8], status: u16) -> ResponseHeader {
+        let proxy = HttpProxy::new(PassThrough, Arc::new(ServerConf::default()));
+        let mut session = request_session(request).await;
+        let mut ctx = ();
+        let mut serve_from_cache = ServeFromCache::new();
+        let mut range_body_filter = RangeBodyFilter::new();
+        let task = HttpTask::Header(
+            Box::new(ResponseHeader::build(status, None).unwrap()),
+            false,
+        );
+
+        match proxy
+            .h1_response_filter(
+                &mut session,
+                task,
+                &mut ctx,
+                &mut serve_from_cache,
+                &mut range_body_filter,
+                false,
+            )
+            .await
+            .unwrap()
+        {
+            HttpTask::Header(header, _) => *header,
+            _ => panic!("task should be header"),
+        }
+    }
+
+    const CONNECT_REQUEST: &[u8] =
+        b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+
+    #[tokio::test]
+    async fn h1_response_filter_chunks_only_body_bearing_responses() {
+        // RFC 9110 §9.3.6: a 2xx to CONNECT starts a tunnel and must not carry
+        // Transfer-Encoding; a refusal is an ordinary response and still does.
+        let get: &[u8] = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        for (request, status, chunked) in [
+            (CONNECT_REQUEST, 200, false),
+            (CONNECT_REQUEST, 204, false),
+            (CONNECT_REQUEST, 403, true),
+            (get, 200, true),
+        ] {
+            let header = filtered_unframed_response(request, status).await;
+            assert_eq!(
+                header
+                    .headers
+                    .get(http::header::TRANSFER_ENCODING)
+                    .is_some(),
+                chunked,
+                "{} {status}: unexpected Transfer-Encoding: {:?}",
+                String::from_utf8_lossy(&request[..7]),
+                header.headers.get(http::header::TRANSFER_ENCODING)
+            );
         }
     }
 

@@ -966,8 +966,7 @@ where
                 header.set_version(Version::HTTP_11);
 
                 // these status codes / method cannot have body, so no need to add chunked encoding
-                let no_body = session.req_header().method == "HEAD"
-                    || matches!(header.status.as_u16(), 204 | 304);
+                let no_body = response_has_no_body(session.req_header(), header.status);
 
                 /* Add chunked header to tell downstream to use chunked encoding
                  * during the absent of content-length in h2 */

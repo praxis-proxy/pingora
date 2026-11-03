@@ -693,10 +693,13 @@ impl HttpSession {
         }
     }
 
-    /// Was this request successfully turned into an upgraded connection?
+    /// Whether this request switched protocols through an Upgrade handshake
+    /// or established a tunnel through a successful CONNECT response.
     ///
-    /// Both the request had to have been an `Upgrade` request
-    /// and the response had to have been a `101 Switching Protocols`.
+    /// Either the request was an `Upgrade` request answered with
+    /// `101 Switching Protocols`, or it was a `CONNECT` answered with a 2xx
+    /// (RFC 9110 section 9.3.6). Either way the rest of the connection is raw
+    /// bytes.
     pub fn was_upgraded(&self) -> bool {
         self.upgraded
     }

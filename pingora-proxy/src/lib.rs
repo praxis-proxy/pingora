@@ -614,7 +614,8 @@ where
     /// deliberately distinct from `Some(0)` so that "not measured" cannot be mistaken for
     /// "a request body was dropped".
     upstream_body_bytes_sent: Option<usize>,
-    /// Whether proxy task filtering has seen a downstream 101 upgrade header.
+    /// Whether proxy task filtering has seen a downstream header that switches the
+    /// connection to raw bytes: a 101 upgrade, or a 2xx to CONNECT on HTTP/1.
     downstream_task_seen_upgraded: bool,
     /// Upstream write pending time. Set by proxy layer (HTTP/1.x only).
     upstream_write_pending_time: Duration,
@@ -1105,7 +1106,7 @@ where
     Error::e_explain(
         InvalidHTTPHeader,
         format!(
-            "received {task} task after downstream 101 upgrade: downstream_upgrade_req={}, upstream_upgrade_req={:?}, downstream_was_upgraded={}, downstream_task_seen_upgraded={}, task_filter_seen_upgraded={}",
+            "received {task} task after downstream 101 upgrade or CONNECT tunnel: downstream_upgrade_req={}, upstream_upgrade_req={:?}, downstream_was_upgraded={}, downstream_task_seen_upgraded={}, task_filter_seen_upgraded={}",
             status.downstream,
             status.upstream,
             session.was_upgraded(),
@@ -1127,7 +1128,7 @@ where
     Error::e_explain(
         InvalidHTTPHeader,
         format!(
-            "received upgraded body task before downstream 101 upgrade: downstream_upgrade_req={}, upstream_upgrade_req={:?}, downstream_was_upgraded={}, downstream_task_seen_upgraded={}, task_filter_seen_upgraded={}",
+            "received upgraded body task before downstream 101 upgrade or CONNECT tunnel: downstream_upgrade_req={}, upstream_upgrade_req={:?}, downstream_was_upgraded={}, downstream_task_seen_upgraded={}, task_filter_seen_upgraded={}",
             status.downstream,
             status.upstream,
             session.was_upgraded(),

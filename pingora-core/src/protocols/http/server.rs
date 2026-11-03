@@ -851,7 +851,11 @@ where
         }
     }
 
-    /// Whether this session was fully upgraded (completed Upgrade handshake).
+    /// Whether this session switched protocols through an Upgrade handshake or
+    /// established a tunnel through a successful CONNECT response.
+    ///
+    /// Always `false` for HTTP/2, which never upgrades and keeps CONNECT tunnels
+    /// framed in DATA frames.
     pub fn was_upgraded(&self) -> bool {
         match self {
             Self::H1(s) => s.was_upgraded(),

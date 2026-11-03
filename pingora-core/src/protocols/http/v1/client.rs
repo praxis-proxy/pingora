@@ -209,6 +209,14 @@ impl HttpSession {
             .as_ref()
             .expect("response header must be read");
 
+        // RFC 9110 section 9.3.6: "A client MUST ignore any Content-Length or
+        // Transfer-Encoding header fields received in a successful response to
+        // CONNECT." The tunnel is close-delimited whatever they say, so their
+        // values are not validated; refusals keep the usual framing checks.
+        if self.is_connect_tunnel_resp(resp_header) {
+            return Ok(());
+        }
+
         // Validate/reconcile Content-Length per RFC 9110 section 8.6 (hyper
         // parity): identical duplicates and comma-combined identical values are
         // accepted and collapsed. Conflicting or duplicate values are always an
@@ -770,10 +778,13 @@ impl HttpSession {
         }
     }
 
-    /// Was this request successfully turned into an upgraded connection?
+    /// Whether this request switched protocols through an Upgrade handshake
+    /// or established a tunnel through a successful CONNECT response.
     ///
-    /// Both the request had to have been an `Upgrade` request
-    /// and the response had to have been a `101 Switching Protocols`.
+    /// Either the request was an `Upgrade` request answered with
+    /// `101 Switching Protocols`, or it was a `CONNECT` answered with a 2xx
+    /// (RFC 9110 section 9.3.6). Either way the rest of the connection is raw
+    /// bytes.
     pub fn was_upgraded(&self) -> bool {
         self.upgraded
     }
@@ -2156,6 +2167,96 @@ mod tests_stream {
         }
         assert!(!http_stream.was_upgraded());
         assert!(http_stream.is_body_done());
+    }
+
+    #[rstest]
+    #[case::invalid_content_length("Content-Length: ignored")]
+    #[case::conflicting_content_length("Content-Length: 1\r\nContent-Length: 2")]
+    #[case::transfer_encoding("Transfer-Encoding: chunked")]
+    #[tokio::test]
+    async fn connect_2xx_resp_ignores_framing_headers(#[case] framing: &str) {
+        init_log();
+        // RFC 9110 §9.3.6: "A client MUST ignore any Content-Length or
+        // Transfer-Encoding header fields received in a successful response to
+        // CONNECT." They must not fail validation or frame the tunnel.
+        let wire = b"CONNECT pingora.org:443 HTTP/1.1\r\n\r\n";
+        let input1 = format!("HTTP/1.1 200 OK\r\n{framing}\r\n\r\n");
+        let input2 = b"tunnel";
+
+        let mock_io = Builder::new()
+            .write(wire)
+            .read(input1.as_bytes())
+            .read(&input2[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let request = RequestHeader::build("CONNECT", b"pingora.org:443", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(request))
+            .await
+            .unwrap();
+
+        let task = http_stream.read_response_task().await.unwrap();
+        assert!(matches!(task, HttpTask::Header(h, false) if h.status == 200));
+        assert!(http_stream.was_upgraded());
+        assert_eq!(
+            http_stream.body_reader.body_state,
+            ParseState::UntilClose(0)
+        );
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::UpgradedBody(b, eob) => {
+                assert_eq!(b.unwrap(), &input2[..]);
+                assert!(!eob);
+            }
+            _ => panic!("task should be upgraded body"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_non_2xx_resp_still_validates_content_length() {
+        init_log();
+        // Only a successful CONNECT response skips framing validation; a
+        // refusal is an ordinary response.
+        let wire = b"CONNECT pingora.org:443 HTTP/1.1\r\n\r\n";
+        let input = b"HTTP/1.1 403 Forbidden\r\nContent-Length: ignored\r\n\r\n";
+
+        let mock_io = Builder::new().write(wire).read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let request = RequestHeader::build("CONNECT", b"pingora.org:443", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(request))
+            .await
+            .unwrap();
+
+        let res = http_stream.read_response_task().await;
+        assert_eq!(res.unwrap_err().etype(), &ErrorType::InvalidHTTPHeader);
+    }
+
+    #[rstest]
+    #[case::ok("HTTP/1.1 200 OK\r\n\r\n")]
+    #[case::no_content("HTTP/1.1 204 No Content\r\n\r\n")]
+    #[case::keepalive_requested("HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n")]
+    #[tokio::test]
+    async fn connect_2xx_resp_disables_connection_reuse(#[case] response: &str) {
+        init_log();
+        // A tunnel owns the rest of the connection, so it is never returned to
+        // the pool, even when the response asks for keep-alive.
+        let wire = b"CONNECT pingora.org:443 HTTP/1.1\r\n\r\n";
+        let mock_io = Builder::new().write(wire).read(response.as_bytes()).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let request = RequestHeader::build("CONNECT", b"pingora.org:443", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(request))
+            .await
+            .unwrap();
+
+        http_stream.read_response_task().await.unwrap();
+        http_stream.respect_keepalive();
+        assert!(http_stream.was_upgraded());
+        assert!(
+            !http_stream.will_keepalive(),
+            "a CONNECT tunnel connection must not be reused"
+        );
     }
 
     #[tokio::test]
