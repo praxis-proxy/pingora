@@ -332,12 +332,20 @@ where
                 },
 
                 body = rx.recv(), if !request_done => {
+                    // A framed Body belongs to the HTTP request sent before the
+                    // protocol switch. Its end only completes that request, and it
+                    // can arrive after a fast 101 or CONNECT 2xx was read. Only the
+                    // tunnel's own end (UpgradedBody end, or a closed pipe) ends an
+                    // upgraded relay.
+                    let pre_upgrade_request = matches!(body, Some(HttpTask::Body(..)));
                     match send_body_to1(client_session, body).await {
                         Ok(send_done) => {
-                            request_done = send_done;
-                            // An upgraded request is terminated when either side is done
-                            if request_done && client_session.was_upgraded() {
-                                response_done = true;
+                            if !(upgraded && pre_upgrade_request) {
+                                request_done = send_done;
+                                // An upgraded request is terminated when either side is done
+                                if request_done && client_session.was_upgraded() {
+                                    response_done = true;
+                                }
                             }
                         },
                         Err(e) => {
@@ -1494,5 +1502,157 @@ mod tests {
 
         assert_eq!(err.etype(), &InvalidHTTPHeader);
         assert_eq!(err.esource(), &ErrorSource::Upstream);
+    }
+
+    /// When the request's end marker reaches the upstream relay, relative to
+    /// the upstream response that switches protocols.
+    #[derive(Clone, Copy, Debug)]
+    enum EndMarker {
+        /// Queued before the response is read: the usual order.
+        BeforeResponse,
+        /// Delivered after the response was read: a fast 101 or CONNECT 2xx.
+        AfterResponse,
+    }
+
+    /// Relay one upgraded request through `proxy_handle_upstream` with the
+    /// downstream's end-of-request marker delivered in the given order relative
+    /// to the switching response, and check the tunnel stays open until its own
+    /// end.
+    ///
+    /// Each step waits on one ready event, so `select!` branch order never
+    /// decides the outcome: the ordering is fixed by construction.
+    async fn relay_upgraded_request(request: &[u8], response: &[u8], end_marker: EndMarker) {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        const PIPE: usize = 4;
+        let proxy = HttpProxy::new(PassThrough, Arc::new(ServerConf::default()));
+        let (proxy_io, mut origin) = tokio::io::duplex(4096);
+        let mut client_session = HttpSessionV1::new(Box::new(proxy_io));
+        let downstream = request_session(request).await;
+        client_session
+            .write_request_header(Box::new(downstream.req_header().clone()))
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            origin.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+
+        let (tx_up, mut rx_up) = mpsc::channel(PIPE);
+        let (tx_down, rx_down) = mpsc::channel(PIPE);
+        let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
+        let relay = proxy.proxy_handle_upstream(&mut client_session, tx_up, rx_down, pipe_state);
+        tokio::pin!(relay);
+
+        match end_marker {
+            EndMarker::BeforeResponse => {
+                // The relay consumes the marker while no response is readable yet.
+                tx_down.send(HttpTask::Body(None, true)).await.unwrap();
+                while tx_down.capacity() < PIPE {
+                    tokio::select! {
+                        biased;
+                        res = &mut relay => panic!("relay ended on the request end: {res:?}"),
+                        _ = tokio::task::yield_now() => {},
+                    }
+                }
+                origin.write_all(response).await.unwrap();
+            }
+            // The response is readable while the pipe is still empty.
+            EndMarker::AfterResponse => origin.write_all(response).await.unwrap(),
+        }
+
+        // The response switches the upstream connection to raw bytes.
+        let header = tokio::select! {
+            biased;
+            res = &mut relay => panic!("relay ended before the response: {res:?}"),
+            task = rx_up.recv() => task.expect("response header"),
+        };
+        match header {
+            HttpTask::Header(resp, false) => assert!(
+                resp.status == 101 || resp.status.is_success(),
+                "{}",
+                resp.status
+            ),
+            other => panic!("expected the switching response header, got {other:?}"),
+        }
+
+        if let EndMarker::AfterResponse = end_marker {
+            tx_down.send(HttpTask::Body(None, true)).await.unwrap();
+        }
+        tx_down
+            .send(HttpTask::UpgradedBody(
+                Some(Bytes::from_static(b"hello")),
+                false,
+            ))
+            .await
+            .unwrap();
+
+        // The end of the HTTP request is not the end of the tunnel: tunnel
+        // bytes must still reach the origin.
+        let mut tunnel = [0u8; 5];
+        tokio::select! {
+            biased;
+            res = &mut relay => panic!(
+                "{end_marker:?}: tunnel closed on the request end marker: {res:?}"
+            ),
+            read = origin.read_exact(&mut tunnel) => read.unwrap(),
+        };
+        assert_eq!(&tunnel, b"hello", "{end_marker:?}");
+
+        // The tunnel's own end still ends the relay.
+        tx_down
+            .send(HttpTask::UpgradedBody(None, true))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), &mut relay)
+            .await
+            .unwrap_or_else(|_| panic!("{end_marker:?}: relay must end at tunnel EOF"))
+            .unwrap();
+    }
+
+    const WEBSOCKET_REQUEST: &[u8] =
+        b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+
+    #[tokio::test]
+    async fn connect_tunnel_survives_request_end_after_fast_2xx() {
+        relay_upgraded_request(
+            CONNECT_REQUEST,
+            b"HTTP/1.1 200 OK\r\n\r\n",
+            EndMarker::AfterResponse,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn connect_tunnel_survives_request_end_before_2xx() {
+        relay_upgraded_request(
+            CONNECT_REQUEST,
+            b"HTTP/1.1 200 OK\r\n\r\n",
+            EndMarker::BeforeResponse,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upgrade_tunnel_survives_request_end_after_fast_101() {
+        relay_upgraded_request(
+            WEBSOCKET_REQUEST,
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            EndMarker::AfterResponse,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upgrade_tunnel_survives_request_end_before_101() {
+        relay_upgraded_request(
+            WEBSOCKET_REQUEST,
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            EndMarker::BeforeResponse,
+        )
+        .await;
     }
 }

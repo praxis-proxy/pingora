@@ -1210,6 +1210,38 @@ async fn test_connect_tunnel_not_compressed() {
 }
 
 #[tokio::test]
+async fn test_connect_tunnel_survives_request_end_after_fast_2xx() {
+    // The test proxy holds back the end of the empty CONNECT request
+    // (x-delay-request-end), so the upstream's 200 reaches the relay first.
+    // That late end marker must only complete the HTTP request, not close the
+    // tunnel.
+    init_proxy().await;
+    let upstream = connect_upstream(b"HTTP/1.1 200 OK\r\n\r\n", std::time::Duration::ZERO).await;
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    stream
+        .write_all(connect_request(upstream, "X-Delay-Request-End: 1\r\n").as_bytes())
+        .await
+        .unwrap();
+
+    let (head, tunnel) = read_connect_response(&mut stream, 0).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(tunnel.is_empty(), "{tunnel:?}");
+
+    // Wait past the delayed end marker, then use the tunnel.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    stream.write_all(b"after the end marker").await.unwrap();
+    let mut echoed = vec![0u8; 20];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_exact(&mut echoed),
+    )
+    .await
+    .expect("tunnel must still be open")
+    .expect("tunnel closed on the request end marker");
+    assert_eq!(echoed, b"after the end marker");
+}
+
+#[tokio::test]
 async fn test_connect_proxying_tunnel_round_trip_h1_proxy_tasks() {
     connect_tunnel_round_trip("X-Proxy-Tasks-Enabled: 1\r\n").await;
 }
