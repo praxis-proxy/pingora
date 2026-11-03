@@ -902,12 +902,10 @@ async fn test_connect_proxying_allowed_h1() {
     );
     stream.write_all(request.as_bytes()).await.unwrap();
 
-    let mut buf = vec![0u8; 1024];
-    let read = stream.read(&mut buf).await.unwrap();
-    let resp = std::str::from_utf8(&buf[..read]).unwrap();
+    let resp = read_until_ends_with(&mut stream, b"ok").await;
     let status_line = resp.lines().next().unwrap_or("");
-    assert!(status_line.contains(" 200 "));
-    assert!(resp.ends_with("ok"));
+    assert!(status_line.contains(" 200 "), "{resp:?}");
+    assert!(resp.ends_with("ok"), "{resp:?}");
 }
 
 #[tokio::test]
@@ -935,12 +933,31 @@ async fn test_connect_proxying_allowed_h1_without_host() {
     );
     stream.write_all(request.as_bytes()).await.unwrap();
 
-    let mut buf = vec![0u8; 1024];
-    let read = stream.read(&mut buf).await.unwrap();
-    let resp = std::str::from_utf8(&buf[..read]).unwrap();
+    let resp = read_until_ends_with(&mut stream, b"ok").await;
     let status_line = resp.lines().next().unwrap_or("");
-    assert!(status_line.contains(" 200 "));
-    assert!(resp.ends_with("ok"));
+    assert!(status_line.contains(" 200 "), "{resp:?}");
+    assert!(resp.ends_with("ok"), "{resp:?}");
+}
+
+/// Read until the bytes received end with `suffix`, or the peer closes.
+///
+/// A CONNECT 2xx head is flushed on its own, so the tunnel bytes after it can
+/// arrive in a later read; asserting on a single `read()` is flaky.
+async fn read_until_ends_with(stream: &mut TcpStream, suffix: &[u8]) -> String {
+    let deadline = std::time::Duration::from_secs(5);
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !resp.ends_with(suffix) {
+        let read = tokio::time::timeout(deadline, stream.read(&mut buf))
+            .await
+            .expect("response within the deadline")
+            .unwrap();
+        if read == 0 {
+            break;
+        }
+        resp.extend_from_slice(&buf[..read]);
+    }
+    String::from_utf8(resp).unwrap()
 }
 
 /// Read a complete HTTP/1 header block. A single `read()` can return a partial
