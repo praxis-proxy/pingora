@@ -2043,6 +2043,24 @@ mod tests {
         session
     }
 
+    /// A session for `request` with the downstream gzip compression module on,
+    /// with the request header already run through the modules.
+    async fn new_compressing_session(request: &[u8], written: Arc<Mutex<Vec<u8>>>) -> Session {
+        let mut modules = HttpModules::new();
+        modules.add_module(ResponseCompressionBuilder::enable(6));
+        let socket = StaticVirtualSocket::new(request, written);
+        let stream = L4Stream::from(VirtualSocketStream::new(Box::new(socket)));
+        let mut session = Session::new_h1_with_modules(Box::new(stream), &modules);
+        session.read_request().await.unwrap();
+        let mut req = session.req_header().clone();
+        session
+            .downstream_modules_ctx
+            .request_header_filter(&mut req)
+            .await
+            .unwrap();
+        session
+    }
+
     async fn new_upgrade_request_session(written: Arc<Mutex<Vec<u8>>>) -> Session {
         new_request_session(
             b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
@@ -2553,6 +2571,74 @@ mod tests {
             out.ends_with(b"ok"),
             "tunnel bytes must be written unframed: {:?}",
             String::from_utf8_lossy(&out)
+        );
+    }
+
+    const CONNECT_GZIP_REQUEST: &[u8] =
+        b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nAccept-Encoding: gzip\r\n\r\n";
+
+    #[tokio::test]
+    async fn downstream_compression_leaves_connect_tunnel_bytes_raw() {
+        // With gzip on and a client that accepts it, a 2xx to CONNECT whose
+        // header looks compressible (text/plain) must still carry raw tunnel
+        // bytes: the module stops at the tunnel, as it does for 101.
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut session = new_compressing_session(CONNECT_GZIP_REQUEST, written.clone()).await;
+
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header(header::CONTENT_TYPE, "text/plain")
+            .unwrap();
+        let tunnel = b"tunnel bytes, tunnel bytes, tunnel bytes";
+        session
+            .write_response_tasks(vec![
+                HttpTask::Header(Box::new(resp), false),
+                HttpTask::UpgradedBody(Some(Bytes::from_static(tunnel)), false),
+            ])
+            .await
+            .unwrap();
+
+        let out = written.lock().unwrap().clone();
+        let head_end = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&out[..head_end]).to_ascii_lowercase();
+        assert!(
+            !head.contains("content-encoding"),
+            "tunnel head must not claim an encoding: {head:?}"
+        );
+        assert_eq!(
+            &out[head_end + 4..],
+            &tunnel[..],
+            "tunnel bytes must pass through uncompressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn downstream_compression_still_compresses_refused_connect() {
+        // A refused CONNECT is an ordinary response and keeps compression.
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut session = new_compressing_session(CONNECT_GZIP_REQUEST, written.clone()).await;
+
+        let mut resp = ResponseHeader::build(403, None).unwrap();
+        resp.insert_header(header::CONTENT_TYPE, "text/plain")
+            .unwrap();
+        resp.insert_header(header::TRANSFER_ENCODING, "chunked")
+            .unwrap();
+        session
+            .write_response_tasks(vec![
+                HttpTask::Header(Box::new(resp), false),
+                HttpTask::Body(
+                    Some(Bytes::from_static(b"forbidden forbidden forbidden")),
+                    true,
+                ),
+            ])
+            .await
+            .unwrap();
+
+        let out = written.lock().unwrap().clone();
+        let head_end = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&out[..head_end]).to_ascii_lowercase();
+        assert!(
+            head.contains("content-encoding: gzip"),
+            "refused CONNECT should still be compressed: {head:?}"
         );
     }
 

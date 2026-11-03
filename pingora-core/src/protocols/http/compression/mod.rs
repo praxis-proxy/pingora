@@ -83,6 +83,9 @@ enum CtxInner {
         preserve_etag: [bool; Algorithm::COUNT],
         // Optional dictionary for dcz compression (RFC 9842).
         dictionary: Option<DictionaryData>,
+        // Whether the request is CONNECT: a 2xx to it opens a tunnel whose bytes
+        // must not be transformed (RFC 9110 section 9.3.6).
+        connect_req: bool,
     },
     BodyPhase(Option<Box<dyn Encode + Send + Sync>>),
 }
@@ -100,6 +103,7 @@ impl ResponseCompressionCtx {
             decompress_enable: [decompress_enable; Algorithm::COUNT],
             preserve_etag: [preserve_etag; Algorithm::COUNT],
             dictionary: None,
+            connect_req: false,
         })
     }
 
@@ -249,6 +253,11 @@ impl ResponseCompressionCtx {
 
     /// Feed the request header into this ctx.
     pub fn request_filter(&mut self, req: &RequestHeader) {
+        // Recorded even while disabled: the ctx can be enabled later, before the
+        // response header arrives, and must still leave a CONNECT tunnel alone.
+        if let CtxInner::HeaderPhase { connect_req, .. } = &mut self.0 {
+            *connect_req = req.method == http::Method::CONNECT;
+        }
         if !self.is_enabled() {
             return;
         }
@@ -288,10 +297,15 @@ impl ResponseCompressionCtx {
             CtxInner::HeaderPhase {
                 decompress_enable,
                 accept_encoding,
+                connect_req,
                 ..
             } => {
                 // an informational response is not the final one, the filter defers the decision
                 if resp.status.is_informational() {
+                    return false;
+                }
+                // a CONNECT tunnel is never transformed, mirroring the response header filter
+                if is_connect_tunnel(*connect_req, resp) {
                     return false;
                 }
                 match decide_action(resp, accept_encoding) {
@@ -320,6 +334,7 @@ impl ResponseCompressionCtx {
                 accept_encoding,
                 encoding_levels: levels,
                 dictionary,
+                connect_req,
             } => {
                 if resp.status.is_informational() {
                     if resp.status == http::status::StatusCode::SWITCHING_PROTOCOLS {
@@ -327,6 +342,13 @@ impl ResponseCompressionCtx {
                         self.0 = CtxInner::BodyPhase(None);
                     }
                     // else, wait for the final response header for decision
+                    return;
+                }
+                // Like 101, a 2xx to CONNECT switches the connection to raw tunnel
+                // bytes, which must pass through untouched; refusals are ordinary
+                // responses and are still (de)compressed.
+                if is_connect_tunnel(*connect_req, resp) {
+                    self.0 = CtxInner::BodyPhase(None);
                     return;
                 }
                 // do nothing if no body
@@ -686,6 +708,12 @@ fn test_decide_on_accept_encoding() {
 }
 
 // filter response header to see if (de)compression is needed
+/// Whether `resp` establishes a CONNECT tunnel: a 2xx to a CONNECT request
+/// (RFC 9110 section 9.3.6).
+fn is_connect_tunnel(connect_req: bool, resp: &ResponseHeader) -> bool {
+    connect_req && resp.status.is_success()
+}
+
 fn decide_action(resp: &ResponseHeader, accept_encoding: &[Algorithm]) -> Action {
     use http::header::CONTENT_ENCODING;
 
@@ -974,6 +1002,99 @@ fn test_will_decompress_agrees_with_response_header_filter() {
              accept-encoding {accept_encoding:?}, content-encoding {content_encoding:?}"
         );
     }
+}
+
+#[cfg(test)]
+fn connect_ctx_for_test(
+    compression_level: u32,
+    decompress_enable: bool,
+    accept_encoding: &str,
+) -> ResponseCompressionCtx {
+    let mut ctx = ResponseCompressionCtx::new(compression_level, decompress_enable, false);
+    let mut req = RequestHeader::build("CONNECT", b"example.com:443", None).unwrap();
+    req.insert_header("accept-encoding", accept_encoding)
+        .unwrap();
+    ctx.request_filter(&req);
+    ctx
+}
+
+#[test]
+fn test_connect_tunnel_is_never_transformed() {
+    // RFC 9110 §9.3.6: a 2xx to CONNECT switches to tunnel mode, like 101. The
+    // tunnel bytes must pass through: no compression, no decompression.
+    for (level, decompress, content_encoding) in [
+        (6, false, None),
+        (6, true, None),
+        (0, true, Some("gzip")),
+        (6, true, Some("br")),
+    ] {
+        for status in [200, 204] {
+            let mut ctx = connect_ctx_for_test(level, decompress, "br");
+            let mut resp = resp_for_test(status, content_encoding);
+            assert!(
+                !ctx.will_decompress(&resp),
+                "CONNECT {status} must not be predicted as decompressed"
+            );
+
+            ctx.response_header_filter(&mut resp, false);
+            assert_eq!(
+                resp.headers
+                    .get(http::header::CONTENT_ENCODING)
+                    .map(|ce| ce.as_bytes()),
+                content_encoding.map(str::as_bytes),
+                "CONNECT {status}: content-encoding must be left as the upstream sent it"
+            );
+            assert!(
+                resp.headers.get(http::header::TRANSFER_ENCODING).is_none(),
+                "CONNECT {status}: tunnel response must not be re-framed"
+            );
+            assert!(
+                !ctx.is_enabled(),
+                "CONNECT {status}: no encoder for the tunnel"
+            );
+            let mut body = Some(Bytes::from_static(b"tunnel bytes"));
+            assert_eq!(ctx.response_body_filter(body.as_ref(), false), None);
+            assert_eq!(body.take().unwrap(), &b"tunnel bytes"[..]);
+        }
+    }
+}
+
+#[test]
+fn test_refused_connect_is_still_compressed() {
+    // Only a successful CONNECT is a tunnel; a refusal is an ordinary response.
+    let mut ctx = connect_ctx_for_test(6, false, "gzip");
+    let mut resp = resp_for_test(403, None);
+    ctx.response_header_filter(&mut resp, false);
+    assert_eq!(
+        resp.headers.get(http::header::CONTENT_ENCODING).unwrap(),
+        "gzip"
+    );
+    assert!(ctx.is_enabled());
+}
+
+#[test]
+fn test_connect_tunnel_untouched_when_level_raised_after_request() {
+    // A filter may raise the compression level between the request and the
+    // response; the tunnel must still pass through. The ctx is enabled (for
+    // decompression) when the request is seen, so it knows the client takes
+    // gzip and would compress an ordinary response at the raised level.
+    let mut ctx = connect_ctx_for_test(0, true, "gzip");
+    ctx.adjust_level(6);
+
+    let mut resp = resp_for_test(200, None);
+    ctx.response_header_filter(&mut resp, false);
+    assert!(resp.headers.get(http::header::CONTENT_ENCODING).is_none());
+    assert!(!ctx.is_enabled());
+
+    // control: the same ctx setup compresses a refused CONNECT
+    let mut ctx = connect_ctx_for_test(0, true, "gzip");
+    ctx.adjust_level(6);
+    let mut resp = resp_for_test(403, None);
+    ctx.response_header_filter(&mut resp, false);
+    assert_eq!(
+        resp.headers.get(http::header::CONTENT_ENCODING).unwrap(),
+        "gzip"
+    );
 }
 
 use once_cell::sync::Lazy;
