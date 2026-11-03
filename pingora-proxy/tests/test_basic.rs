@@ -902,12 +902,10 @@ async fn test_connect_proxying_allowed_h1() {
     );
     stream.write_all(request.as_bytes()).await.unwrap();
 
-    let mut buf = vec![0u8; 1024];
-    let read = stream.read(&mut buf).await.unwrap();
-    let resp = std::str::from_utf8(&buf[..read]).unwrap();
+    let resp = read_until_ends_with(&mut stream, b"ok").await;
     let status_line = resp.lines().next().unwrap_or("");
-    assert!(status_line.contains(" 200 "));
-    assert!(resp.ends_with("ok"));
+    assert!(status_line.contains(" 200 "), "{resp:?}");
+    assert!(resp.ends_with("ok"), "{resp:?}");
 }
 
 #[tokio::test]
@@ -935,12 +933,31 @@ async fn test_connect_proxying_allowed_h1_without_host() {
     );
     stream.write_all(request.as_bytes()).await.unwrap();
 
-    let mut buf = vec![0u8; 1024];
-    let read = stream.read(&mut buf).await.unwrap();
-    let resp = std::str::from_utf8(&buf[..read]).unwrap();
+    let resp = read_until_ends_with(&mut stream, b"ok").await;
     let status_line = resp.lines().next().unwrap_or("");
-    assert!(status_line.contains(" 200 "));
-    assert!(resp.ends_with("ok"));
+    assert!(status_line.contains(" 200 "), "{resp:?}");
+    assert!(resp.ends_with("ok"), "{resp:?}");
+}
+
+/// Read until the bytes received end with `suffix`, or the peer closes.
+///
+/// A CONNECT 2xx head is flushed on its own, so the tunnel bytes after it can
+/// arrive in a later read; asserting on a single `read()` is flaky.
+async fn read_until_ends_with(stream: &mut TcpStream, suffix: &[u8]) -> String {
+    let deadline = std::time::Duration::from_secs(5);
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !resp.ends_with(suffix) {
+        let read = tokio::time::timeout(deadline, stream.read(&mut buf))
+            .await
+            .expect("response within the deadline")
+            .unwrap();
+        if read == 0 {
+            break;
+        }
+        resp.extend_from_slice(&buf[..read]);
+    }
+    String::from_utf8(resp).unwrap()
 }
 
 /// Read a complete HTTP/1 header block. A single `read()` can return a partial
@@ -954,6 +971,279 @@ async fn read_h1_head(stream: &mut TcpStream) -> String {
         head.extend_from_slice(&buf[..read]);
     }
     String::from_utf8_lossy(&head).into_owned()
+}
+
+/// Proxy a CONNECT tunnel through an upstream that answers with a bare 2xx (no
+/// framing headers, as real proxies do) and then echoes what it receives.
+/// The client sends only after it reads the 2xx, the same as a TLS client,
+/// so the test covers both tunnel directions and the flush of the head.
+async fn connect_tunnel_round_trip(extra_header: &str) {
+    use std::time::Duration;
+    init_proxy().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_h1_head(&mut socket).await;
+        socket
+            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            socket.write_all(&buf[..n]).await.unwrap();
+        }
+    });
+
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    let request = format!(
+        "CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\nX-Port: {}\r\n{extra_header}\r\n",
+        upstream_addr.port()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let deadline = Duration::from_secs(5);
+    let head = tokio::time::timeout(deadline, read_h1_head(&mut stream))
+        .await
+        .expect("CONNECT 2xx head must be flushed before any tunnel data");
+    let status_line = head.lines().next().unwrap_or("");
+    assert!(status_line.contains(" 200 "), "{status_line}");
+    let head_lower = head.to_ascii_lowercase();
+    // RFC 9110 section 9.3.6: no framing headers on a 2xx response to CONNECT
+    assert!(!head_lower.contains("transfer-encoding"), "{head}");
+    assert!(!head_lower.contains("content-length"), "{head}");
+    let (_, after_head) = head.split_once("\r\n\r\n").unwrap();
+    assert!(
+        after_head.is_empty(),
+        "unexpected bytes after head: {after_head:?}"
+    );
+
+    // client-to-origin and back: raw bytes, no chunked framing
+    let payload = b"\x16\x03\x01 client hello";
+    stream.write_all(payload).await.unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    tokio::time::timeout(deadline, stream.read_exact(&mut echoed))
+        .await
+        .expect("tunnel bytes must round-trip")
+        .unwrap();
+    assert_eq!(echoed, payload);
+}
+
+#[tokio::test]
+async fn test_connect_proxying_tunnel_round_trip_h1() {
+    connect_tunnel_round_trip("").await;
+}
+
+/// An upstream for one CONNECT: it reads the request head, waits `delay`,
+/// writes `response`, then echoes everything that follows. The proxy forwards
+/// client bytes only once the tunnel is open, so early tunnel data reaches it
+/// after the 2xx; the echo returns it in the order it arrived. The delay lets
+/// a test have the client's early bytes reach the proxy while it is still
+/// waiting for this response. Returns the address to put in `X-Port`.
+async fn connect_upstream(
+    response: &'static [u8],
+    delay: std::time::Duration,
+) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let head = read_h1_head(&mut socket).await;
+        let (_, after_head) = head.split_once("\r\n\r\n").unwrap();
+        assert!(
+            after_head.is_empty(),
+            "tunnel bytes must not be forwarded before the tunnel is open: {after_head:?}"
+        );
+        tokio::time::sleep(delay).await;
+        socket.write_all(response).await.unwrap();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            socket.write_all(&buf[..n]).await.unwrap();
+        }
+    });
+    addr
+}
+
+/// Read a CONNECT response head and then exactly `len` tunnel bytes, whether
+/// or not they arrived in the same read as the head.
+async fn read_connect_response(stream: &mut TcpStream, len: usize) -> (String, Vec<u8>) {
+    use std::time::Duration;
+    let deadline = Duration::from_secs(5);
+    let head = tokio::time::timeout(deadline, read_h1_head(stream))
+        .await
+        .expect("CONNECT response head");
+    let (head, after) = head.split_once("\r\n\r\n").unwrap();
+    let mut tunnel = after.as_bytes().to_vec();
+    let mut buf = vec![0u8; len];
+    while tunnel.len() < len {
+        let n = tokio::time::timeout(deadline, stream.read(&mut buf))
+            .await
+            .expect("tunnel bytes")
+            .unwrap();
+        assert_ne!(0, n, "tunnel closed early");
+        tunnel.extend_from_slice(&buf[..n]);
+    }
+    (head.to_owned(), tunnel)
+}
+
+fn connect_request(upstream: std::net::SocketAddr, extra_headers: &str) -> String {
+    format!(
+        "CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\nX-Port: {}\r\n{extra_headers}\r\n",
+        upstream.port()
+    )
+}
+
+#[tokio::test]
+async fn test_connect_tunnel_bytes_in_the_request_head_read() {
+    // The client sends the CONNECT head and the first tunnel bytes in one
+    // write, as a client that does not wait for the response does. The proxy
+    // keeps them until the tunnel is open, then forwards them first.
+    init_proxy().await;
+    let upstream = connect_upstream(
+        b"HTTP/1.1 200 OK\r\n\r\n",
+        std::time::Duration::from_millis(300),
+    )
+    .await;
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    let mut request = connect_request(upstream, "").into_bytes();
+    request.extend_from_slice(b"early");
+    stream.write_all(&request).await.unwrap();
+
+    let (head, tunnel) = read_connect_response(&mut stream, 5).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(tunnel, b"early", "early bytes must reach the origin first");
+}
+
+#[tokio::test]
+async fn test_connect_tunnel_bytes_in_a_later_read() {
+    // Same bytes, split across two writes: the second arrives as its own read,
+    // after the head, while the proxy is waiting on the upstream connection.
+    init_proxy().await;
+    let upstream = connect_upstream(
+        b"HTTP/1.1 200 OK\r\n\r\n",
+        std::time::Duration::from_millis(300),
+    )
+    .await;
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    stream
+        .write_all(connect_request(upstream, "").as_bytes())
+        .await
+        .unwrap();
+    // The upstream answers at 300ms, so this read happens while the proxy is
+    // still waiting for it: the case that failed with "Sent data after end
+    // of body".
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    stream.write_all(b"early").await.unwrap();
+
+    let (head, tunnel) = read_connect_response(&mut stream, 5).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(
+        tunnel, b"early",
+        "result must not depend on how reads split"
+    );
+}
+
+#[tokio::test]
+async fn test_connect_response_and_tunnel_bytes_in_one_read() {
+    // The upstream writes the 200 and tunnel bytes together; the bytes must
+    // reach the client as tunnel data, not as part of the head or a body.
+    init_proxy().await;
+    let upstream = connect_upstream(
+        b"HTTP/1.1 200 OK\r\n\r\nserver-first",
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    stream
+        .write_all(connect_request(upstream, "").as_bytes())
+        .await
+        .unwrap();
+
+    let (head, tunnel) = read_connect_response(&mut stream, 12).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        !head.to_ascii_lowercase().contains("transfer-encoding"),
+        "{head}"
+    );
+    assert_eq!(tunnel, b"server-first");
+}
+
+#[tokio::test]
+async fn test_connect_tunnel_not_compressed() {
+    // gzip on downstream, a client that accepts it, and a 200 that looks
+    // compressible: the tunnel bytes must still pass through raw.
+    init_proxy().await;
+    let upstream = connect_upstream(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nplain text tunnel bytes plain text tunnel bytes",
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    stream
+        .write_all(
+            connect_request(
+                upstream,
+                "X-Downstream-Compression: 1\r\nAccept-Encoding: gzip\r\n",
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let expected = b"plain text tunnel bytes plain text tunnel bytes";
+    let (head, tunnel) = read_connect_response(&mut stream, expected.len()).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        !head.to_ascii_lowercase().contains("content-encoding"),
+        "tunnel head must not claim an encoding: {head}"
+    );
+    assert_eq!(tunnel, expected, "tunnel bytes must not be compressed");
+}
+
+#[tokio::test]
+async fn test_connect_tunnel_survives_request_end_after_fast_2xx() {
+    // The test proxy holds back the end of the empty CONNECT request
+    // (x-delay-request-end), so the upstream's 200 reaches the relay first.
+    // That late end marker must only complete the HTTP request, not close the
+    // tunnel.
+    init_proxy().await;
+    let upstream = connect_upstream(b"HTTP/1.1 200 OK\r\n\r\n", std::time::Duration::ZERO).await;
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    stream
+        .write_all(connect_request(upstream, "X-Delay-Request-End: 1\r\n").as_bytes())
+        .await
+        .unwrap();
+
+    let (head, tunnel) = read_connect_response(&mut stream, 0).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(tunnel.is_empty(), "{tunnel:?}");
+
+    // Wait past the delayed end marker, then use the tunnel.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    stream.write_all(b"after the end marker").await.unwrap();
+    let mut echoed = vec![0u8; 20];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_exact(&mut echoed),
+    )
+    .await
+    .expect("tunnel must still be open")
+    .expect("tunnel closed on the request end marker");
+    assert_eq!(echoed, b"after the end marker");
+}
+
+#[tokio::test]
+async fn test_connect_proxying_tunnel_round_trip_h1_proxy_tasks() {
+    connect_tunnel_round_trip("X-Proxy-Tasks-Enabled: 1\r\n").await;
 }
 
 #[tokio::test]

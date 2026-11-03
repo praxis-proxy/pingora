@@ -374,6 +374,17 @@ impl ProxyHttp for ExampleProxyHttp {
         {
             *body = None;
         }
+        // Hold back the end of an empty request so a fast 101 or CONNECT 2xx
+        // reaches the upstream relay before the request's end marker does.
+        if end_of_stream
+            && body.is_none()
+            && session
+                .req_header()
+                .headers
+                .contains_key("x-delay-request-end")
+        {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
         Ok(())
     }
 

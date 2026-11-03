@@ -1862,6 +1862,44 @@ async fn test_upgrade_body_after_101() {
 }
 
 #[tokio::test]
+async fn test_upgrade_survives_request_end_after_fast_101() {
+    // The origin flushes the 101 right after the header, and the test proxy
+    // holds back the end of the empty request (x-delay-request-end), so the 101
+    // reaches the relay first. That late end marker must only complete the HTTP
+    // request, not close the upgraded connection.
+    init();
+    let _ = *WS_ECHO_RAW;
+
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+    let req = concat!(
+        "GET /upgrade HTTP/1.1\r\n",
+        "Host: 127.0.0.1\r\n",
+        "Upgrade: websocket\r\n",
+        "Connection: Upgrade\r\n",
+        "X-Port: 9284\r\n",
+        "X-Delay-Request-End: 1\r\n",
+        "X-Expected-Body-Len: 5\r\n",
+        "\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let fut = read_response_header(&mut stream);
+    let (resp_header, resp_body) = timeout(Duration::from_secs(5), fut).await.unwrap();
+    assert_eq!(resp_header.status, 101);
+
+    // Wait past the delayed end marker, then use the upgraded connection.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    stream.write_all(b"hello").await.unwrap();
+    stream.flush().await.unwrap();
+    let fut = read_response_body(&mut stream, resp_body, 5);
+    let echoed = timeout(Duration::from_secs(5), fut)
+        .await
+        .expect("upgraded connection must still be open");
+    assert_eq!(echoed, b"hello");
+}
+
+#[tokio::test]
 async fn test_download_timeout() {
     init();
     use tokio::time::sleep;

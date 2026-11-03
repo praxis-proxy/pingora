@@ -227,6 +227,13 @@ where
         // 2. the filter code needs to be aware of the host vs :authority across http versions otherwise
         let host = req.remove_header(&http::header::HOST);
 
+        // Checked against the final request, before anything is sent upstream.
+        if let Err(e) = reject_unsupported_connect_tunnel(session, &req, "h2") {
+            return (false, Some(e));
+        }
+        // An HTTP/2 upstream never switches to tunnel mode: it stays framed.
+        session.set_upstream_connect_request(&req, false);
+
         session.upstream_compression.request_filter(&req);
         let body_empty = session.as_mut().is_body_empty();
 
@@ -437,6 +444,7 @@ where
         /* run filters before sending to downstream */
         let mut filtered_tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
         for mut t in tasks {
+            session.record_upstream_connect_response(&t);
             if self.revalidate_or_stale(session, &mut t, ctx).await {
                 serve_from_cache.enable();
                 response_state.enable_cached_response();
@@ -966,8 +974,7 @@ where
                 header.set_version(Version::HTTP_11);
 
                 // these status codes / method cannot have body, so no need to add chunked encoding
-                let no_body = session.req_header().method == "HEAD"
-                    || matches!(header.status.as_u16(), 204 | 304);
+                let no_body = response_has_no_body(session.req_header(), header.status);
 
                 /* Add chunked header to tell downstream to use chunked encoding
                  * during the absent of content-length in h2 */

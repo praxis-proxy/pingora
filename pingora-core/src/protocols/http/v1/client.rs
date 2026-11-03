@@ -209,6 +209,14 @@ impl HttpSession {
             .as_ref()
             .expect("response header must be read");
 
+        // RFC 9110 section 9.3.6: "A client MUST ignore any Content-Length or
+        // Transfer-Encoding header fields received in a successful response to
+        // CONNECT." The tunnel is close-delimited whatever they say, so their
+        // values are not validated; refusals keep the usual framing checks.
+        if self.is_connect_tunnel_resp(resp_header) {
+            return Ok(());
+        }
+
         // Validate/reconcile Content-Length per RFC 9110 section 8.6 (hyper
         // parity): identical duplicates and comma-combined identical values are
         // accepted and collapsed. Conflicting or duplicate values are always an
@@ -343,7 +351,12 @@ impl HttpSession {
                         // convert to upgrade body type
                         // https://datatracker.ietf.org/doc/html/rfc9110#status.101
                         // as an "informational" header, this cannot have a body
-                        self.upgraded = self
+                        // A 2xx response to CONNECT also switches the connection to
+                        // tunnel mode, mirroring the upgrade handshake
+                        // (RFC 9110 section 9.3.6).
+                        self.upgraded = self.is_connect_tunnel_resp(
+                            self.response_header.as_deref().expect("init above"),
+                        ) || self
                             .is_upgrade(self.response_header.as_deref().expect("init above"))
                             .unwrap_or(false);
                         // init body reader if upgrade status has changed body mode
@@ -679,7 +692,18 @@ impl HttpSession {
             // follow https://datatracker.ietf.org/doc/html/rfc9112#section-6.3
             let preread_body = self.preread_body.as_ref().unwrap().get(&self.buf[..]);
 
-            let upgraded = if let Some(code) = self.get_status() {
+            // A 2xx response to CONNECT establishes a tunnel: the rest of the
+            // connection is raw tunnel data, so the reader is close-delimited
+            // even for statuses that are otherwise bodyless, like 204
+            // (RFC 9110 section 9.3.6).
+            let connect_tunnel = self
+                .response_header
+                .as_deref()
+                .is_some_and(|header| self.is_connect_tunnel_resp(header));
+
+            let upgraded = if connect_tunnel {
+                true
+            } else if let Some(code) = self.get_status() {
                 match code.as_u16() {
                     101 => self.is_upgrade_req(),
                     100..=199 => {
@@ -727,6 +751,22 @@ impl HttpSession {
         }
     }
 
+    /// Whether this response establishes a CONNECT tunnel: the request was
+    /// `CONNECT` and the response status is 2xx. RFC 9110 section 9.3.6:
+    /// "Any 2xx (Successful) response indicates that the sender (and all
+    /// inbound proxies) will switch to tunnel mode immediately after the
+    /// response header section."
+    fn is_connect_tunnel_resp(&self, header: &ResponseHeader) -> bool {
+        self.is_connect_req() && header.status.is_success()
+    }
+
+    /// Whether the request written to this connection is `CONNECT`.
+    fn is_connect_req(&self) -> bool {
+        self.request_written
+            .as_deref()
+            .is_some_and(|req| req.method == http::Method::CONNECT)
+    }
+
     /// `Some(true)` if the this is a successful upgrade
     /// `Some(false)` if the request is an upgrade but the response refuses it
     /// `None` if the request is not an upgrade.
@@ -738,10 +778,13 @@ impl HttpSession {
         }
     }
 
-    /// Was this request successfully turned into an upgraded connection?
+    /// Whether this request switched protocols through an Upgrade handshake
+    /// or established a tunnel through a successful CONNECT response.
     ///
-    /// Both the request had to have been an `Upgrade` request
-    /// and the response had to have been a `101 Switching Protocols`.
+    /// Either the request was an `Upgrade` request answered with
+    /// `101 Switching Protocols`, or it was a `CONNECT` answered with a 2xx
+    /// (RFC 9110 section 9.3.6). Either way the rest of the connection is raw
+    /// bytes.
     pub fn was_upgraded(&self) -> bool {
         self.upgraded
     }
@@ -1990,6 +2033,230 @@ mod tests_stream {
                 panic!("task should be upgraded body")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn connect_2xx_resp_switches_to_tunnel() {
+        init_log();
+        // RFC 9110 §9.3.6: any 2xx to CONNECT means the tunnel is established.
+        // The rest of the connection is raw tunnel data, even when the (non-
+        // standard) response carries a Content-Length.
+        let wire = b"CONNECT pingora.org:443 HTTP/1.1\r\n\r\n";
+        let input1 = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n";
+        let input2 = b"ok";
+
+        let mock_io = Builder::new()
+            .write(wire)
+            .read(&input1[..])
+            .read(&input2[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let request = RequestHeader::build("CONNECT", b"pingora.org:443", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(request))
+            .await
+            .unwrap();
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 200);
+                assert!(!eob);
+            }
+            _ => {
+                panic!("task should be header")
+            }
+        }
+        // the upstream half of the connection switched to tunnel mode
+        assert!(http_stream.was_upgraded());
+        assert_eq!(
+            http_stream.body_reader.body_state,
+            ParseState::UntilClose(0)
+        );
+        // tunnel bytes arrive as upgraded body tasks, not framed body
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::UpgradedBody(b, eob) => {
+                assert_eq!(b.unwrap(), &input2[..]);
+                assert!(!eob);
+            }
+            _ => {
+                panic!("task should be upgraded body")
+            }
+        }
+        // request writer converts to close-delimited for tunnel bytes
+        http_stream.maybe_upgrade_body_writer();
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(0));
+    }
+
+    #[tokio::test]
+    async fn connect_204_resp_switches_to_tunnel() {
+        init_log();
+        // 204 is 2xx: the tunnel is established even though the status is
+        // otherwise bodyless (RFC 9110 §9.3.6).
+        let wire = b"CONNECT pingora.org:443 HTTP/1.1\r\n\r\n";
+        let input1 = b"HTTP/1.1 204 No Content\r\n\r\n";
+        let input2 = b"tunnel";
+
+        let mock_io = Builder::new()
+            .write(wire)
+            .read(&input1[..])
+            .read(&input2[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let request = RequestHeader::build("CONNECT", b"pingora.org:443", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(request))
+            .await
+            .unwrap();
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 204);
+                assert!(!eob);
+            }
+            _ => {
+                panic!("task should be header")
+            }
+        }
+        assert!(http_stream.was_upgraded());
+        assert_eq!(
+            http_stream.body_reader.body_state,
+            ParseState::UntilClose(0),
+            "204 to CONNECT must read the rest of the connection as tunnel data"
+        );
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::UpgradedBody(b, eob) => {
+                assert_eq!(b.unwrap(), &input2[..]);
+                assert!(!eob);
+            }
+            _ => {
+                panic!("task should be upgraded body")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_non_2xx_resp_keeps_framing() {
+        init_log();
+        // Only 2xx establishes the tunnel; a refusal keeps the ordinary
+        // framed response semantics.
+        let wire = b"CONNECT pingora.org:443 HTTP/1.1\r\n\r\n";
+        let input1 = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+
+        let mock_io = Builder::new().write(wire).read(&input1[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let request = RequestHeader::build("CONNECT", b"pingora.org:443", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(request))
+            .await
+            .unwrap();
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 403);
+                // CL(0) body is done with the header
+                assert!(eob);
+            }
+            _ => {
+                panic!("task should be header")
+            }
+        }
+        assert!(!http_stream.was_upgraded());
+        assert!(http_stream.is_body_done());
+    }
+
+    #[rstest]
+    #[case::invalid_content_length("Content-Length: ignored")]
+    #[case::conflicting_content_length("Content-Length: 1\r\nContent-Length: 2")]
+    #[case::transfer_encoding("Transfer-Encoding: chunked")]
+    #[tokio::test]
+    async fn connect_2xx_resp_ignores_framing_headers(#[case] framing: &str) {
+        init_log();
+        // RFC 9110 §9.3.6: "A client MUST ignore any Content-Length or
+        // Transfer-Encoding header fields received in a successful response to
+        // CONNECT." They must not fail validation or frame the tunnel.
+        let wire = b"CONNECT pingora.org:443 HTTP/1.1\r\n\r\n";
+        let input1 = format!("HTTP/1.1 200 OK\r\n{framing}\r\n\r\n");
+        let input2 = b"tunnel";
+
+        let mock_io = Builder::new()
+            .write(wire)
+            .read(input1.as_bytes())
+            .read(&input2[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let request = RequestHeader::build("CONNECT", b"pingora.org:443", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(request))
+            .await
+            .unwrap();
+
+        let task = http_stream.read_response_task().await.unwrap();
+        assert!(matches!(task, HttpTask::Header(h, false) if h.status == 200));
+        assert!(http_stream.was_upgraded());
+        assert_eq!(
+            http_stream.body_reader.body_state,
+            ParseState::UntilClose(0)
+        );
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::UpgradedBody(b, eob) => {
+                assert_eq!(b.unwrap(), &input2[..]);
+                assert!(!eob);
+            }
+            _ => panic!("task should be upgraded body"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_non_2xx_resp_still_validates_content_length() {
+        init_log();
+        // Only a successful CONNECT response skips framing validation; a
+        // refusal is an ordinary response.
+        let wire = b"CONNECT pingora.org:443 HTTP/1.1\r\n\r\n";
+        let input = b"HTTP/1.1 403 Forbidden\r\nContent-Length: ignored\r\n\r\n";
+
+        let mock_io = Builder::new().write(wire).read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let request = RequestHeader::build("CONNECT", b"pingora.org:443", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(request))
+            .await
+            .unwrap();
+
+        let res = http_stream.read_response_task().await;
+        assert_eq!(res.unwrap_err().etype(), &ErrorType::InvalidHTTPHeader);
+    }
+
+    #[rstest]
+    #[case::ok("HTTP/1.1 200 OK\r\n\r\n")]
+    #[case::no_content("HTTP/1.1 204 No Content\r\n\r\n")]
+    #[case::keepalive_requested("HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n")]
+    #[tokio::test]
+    async fn connect_2xx_resp_disables_connection_reuse(#[case] response: &str) {
+        init_log();
+        // A tunnel owns the rest of the connection, so it is never returned to
+        // the pool, even when the response asks for keep-alive.
+        let wire = b"CONNECT pingora.org:443 HTTP/1.1\r\n\r\n";
+        let mock_io = Builder::new().write(wire).read(response.as_bytes()).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let request = RequestHeader::build("CONNECT", b"pingora.org:443", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(request))
+            .await
+            .unwrap();
+
+        http_stream.read_response_task().await.unwrap();
+        http_stream.respect_keepalive();
+        assert!(http_stream.was_upgraded());
+        assert!(
+            !http_stream.will_keepalive(),
+            "a CONNECT tunnel connection must not be reused"
+        );
     }
 
     #[tokio::test]

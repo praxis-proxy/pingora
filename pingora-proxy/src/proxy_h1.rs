@@ -116,6 +116,13 @@ where
 
         session.set_upstream_h1_upgrade_request_status(is_h1_upgrade_req(&req));
 
+        // Checked against the final request, after the filters that can change
+        // its method, and before anything is written upstream or downstream.
+        if let Err(e) = reject_unsupported_connect_tunnel(session, &req, "h1") {
+            return (false, true, Some(e));
+        }
+        session.set_upstream_connect_request(&req, true);
+
         session.upstream_compression.request_filter(&req);
 
         debug!("Sending header to upstream {:?}", req);
@@ -325,12 +332,20 @@ where
                 },
 
                 body = rx.recv(), if !request_done => {
+                    // A framed Body belongs to the HTTP request sent before the
+                    // protocol switch. Its end only completes that request, and it
+                    // can arrive after a fast 101 or CONNECT 2xx was read. Only the
+                    // tunnel's own end (UpgradedBody end, or a closed pipe) ends an
+                    // upgraded relay.
+                    let pre_upgrade_request = matches!(body, Some(HttpTask::Body(..)));
                     match send_body_to1(client_session, body).await {
                         Ok(send_done) => {
-                            request_done = send_done;
-                            // An upgraded request is terminated when either side is done
-                            if request_done && client_session.was_upgraded() {
-                                response_done = true;
+                            if !(upgraded && pre_upgrade_request) {
+                                request_done = send_done;
+                                // An upgraded request is terminated when either side is done
+                                if request_done && client_session.was_upgraded() {
+                                    response_done = true;
+                                }
                             }
                         },
                         Err(e) => {
@@ -398,6 +413,9 @@ where
         /* run filters before sending to downstream */
         let mut filtered_tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
         for mut t in tasks {
+            // Before any filter can change it: the upstream connection already
+            // switched (or not) on this status.
+            session.record_upstream_connect_response(&t);
             if self.revalidate_or_stale(session, &mut t, ctx).await {
                 serve_from_cache.enable();
                 response_state.enable_cached_response();
@@ -946,8 +964,7 @@ where
                 /* Convert HTTP 1.0 style response to chunked encoding so that we don't
                  * have to close the downstream connection */
                 // these status codes / method cannot have body, so no need to add chunked encoding
-                let no_body = session.req_header().method == http::method::Method::HEAD
-                    || matches!(header.status.as_u16(), 204 | 304);
+                let no_body = response_has_no_body(session.req_header(), header.status);
                 if !no_body
                     && !header.status.is_informational()
                     && header
@@ -1203,6 +1220,212 @@ mod tests {
         }
     }
 
+    /// A `ProxyHttp` whose filters leave the response unchanged.
+    struct PassThrough;
+
+    #[async_trait]
+    impl ProxyHttp for PassThrough {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("test calls h1_response_filter directly")
+        }
+    }
+
+    async fn request_session(request: &[u8]) -> Session {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(request)
+            .await
+            .expect("test request should be written");
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("test request should parse");
+        session
+    }
+
+    /// Run a header without framing headers, not ending the stream, through
+    /// `h1_response_filter` for `request`.
+    async fn filtered_unframed_response(request: &[u8], status: u16) -> ResponseHeader {
+        let proxy = HttpProxy::new(PassThrough, Arc::new(ServerConf::default()));
+        let mut session = request_session(request).await;
+        let mut ctx = ();
+        let mut serve_from_cache = ServeFromCache::new();
+        let mut range_body_filter = RangeBodyFilter::new();
+        let task = HttpTask::Header(
+            Box::new(ResponseHeader::build(status, None).unwrap()),
+            false,
+        );
+
+        match proxy
+            .h1_response_filter(
+                &mut session,
+                task,
+                &mut ctx,
+                &mut serve_from_cache,
+                &mut range_body_filter,
+                false,
+            )
+            .await
+            .unwrap()
+        {
+            HttpTask::Header(header, _) => *header,
+            _ => panic!("task should be header"),
+        }
+    }
+
+    const CONNECT_REQUEST: &[u8] =
+        b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+
+    #[tokio::test]
+    async fn h1_response_filter_chunks_only_body_bearing_responses() {
+        // RFC 9110 §9.3.6: a 2xx to CONNECT starts a tunnel and must not carry
+        // Transfer-Encoding; a refusal is an ordinary response and still does.
+        let get: &[u8] = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        for (request, status, chunked) in [
+            (CONNECT_REQUEST, 200, false),
+            (CONNECT_REQUEST, 204, false),
+            (CONNECT_REQUEST, 403, true),
+            (get, 200, true),
+        ] {
+            let header = filtered_unframed_response(request, status).await;
+            assert_eq!(
+                header
+                    .headers
+                    .get(http::header::TRANSFER_ENCODING)
+                    .is_some(),
+                chunked,
+                "{} {status}: unexpected Transfer-Encoding: {:?}",
+                String::from_utf8_lossy(&request[..7]),
+                header.headers.get(http::header::TRANSFER_ENCODING)
+            );
+        }
+    }
+
+    /// A `response_filter` that rewrites the final status.
+    struct StatusRewrite(u16);
+
+    #[async_trait]
+    impl ProxyHttp for StatusRewrite {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("test calls h1_response_filter directly")
+        }
+
+        async fn response_filter(
+            &self,
+            _session: &mut Session,
+            response: &mut ResponseHeader,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            response.set_status(self.0)?;
+            Ok(())
+        }
+    }
+
+    /// Run an upstream CONNECT response through the same steps as
+    /// `process_upstream_tasks` and then the downstream write, with a
+    /// `response_filter` that rewrites the status. Returns the write result and
+    /// whatever reached the client.
+    async fn proxy_connect_response_with_rewrite(
+        upstream_status: u16,
+        rewritten_status: u16,
+    ) -> (Result<bool>, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+
+        let proxy = HttpProxy::new(
+            StatusRewrite(rewritten_status),
+            Arc::new(ServerConf::default()),
+        );
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(CONNECT_REQUEST).await.unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session.read_request().await.unwrap();
+
+        // what proxy_1to1 does just before writing the upstream request
+        let upstream_req = session.req_header().clone();
+        reject_unsupported_connect_tunnel(&session, &upstream_req, "h1").unwrap();
+        session.set_upstream_connect_request(&upstream_req, true);
+
+        // what process_upstream_tasks does with the upstream header task
+        let task = HttpTask::Header(
+            Box::new(ResponseHeader::build(upstream_status, None).unwrap()),
+            false,
+        );
+        session.record_upstream_connect_response(&task);
+        let mut ctx = ();
+        let mut serve_from_cache = ServeFromCache::new();
+        let mut range_body_filter = RangeBodyFilter::new();
+        let task = proxy
+            .h1_response_filter(
+                &mut session,
+                task,
+                &mut ctx,
+                &mut serve_from_cache,
+                &mut range_body_filter,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let result = session.write_response_tasks(vec![task]).await;
+        drop(session);
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        (result, out)
+    }
+
+    #[tokio::test]
+    async fn response_filter_cannot_refuse_an_open_tunnel() {
+        // The upstream connection already switched to tunnel mode on its 200.
+        let (result, out) = proxy_connect_response_with_rewrite(200, 403).await;
+        assert_eq!(result.unwrap_err().etype(), &InvalidHTTPHeader);
+        assert!(out.is_empty(), "nothing may reach the client: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn response_filter_cannot_forge_a_tunnel() {
+        // The upstream refused; a 200 here would claim a tunnel that is not open.
+        let (result, out) = proxy_connect_response_with_rewrite(403, 200).await;
+        assert_eq!(result.unwrap_err().etype(), &InvalidHTTPHeader);
+        assert!(out.is_empty(), "no 2xx may reach the client: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn response_filter_may_keep_the_tunnel_decision() {
+        // Changing the status within the same decision is allowed.
+        let (result, out) = proxy_connect_response_with_rewrite(200, 204).await;
+        result.unwrap();
+        assert!(
+            out.starts_with(b"HTTP/1.1 204"),
+            "{:?}",
+            String::from_utf8_lossy(&out)
+        );
+        let (result, out) = proxy_connect_response_with_rewrite(403, 407).await;
+        result.unwrap();
+        assert!(
+            out.starts_with(b"HTTP/1.1 407"),
+            "{:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
     async fn upgrade_request_session() -> Session {
         let (mut client, server) = tokio::io::duplex(1024);
         client
@@ -1279,5 +1502,157 @@ mod tests {
 
         assert_eq!(err.etype(), &InvalidHTTPHeader);
         assert_eq!(err.esource(), &ErrorSource::Upstream);
+    }
+
+    /// When the request's end marker reaches the upstream relay, relative to
+    /// the upstream response that switches protocols.
+    #[derive(Clone, Copy, Debug)]
+    enum EndMarker {
+        /// Queued before the response is read: the usual order.
+        BeforeResponse,
+        /// Delivered after the response was read: a fast 101 or CONNECT 2xx.
+        AfterResponse,
+    }
+
+    /// Relay one upgraded request through `proxy_handle_upstream` with the
+    /// downstream's end-of-request marker delivered in the given order relative
+    /// to the switching response, and check the tunnel stays open until its own
+    /// end.
+    ///
+    /// Each step waits on one ready event, so `select!` branch order never
+    /// decides the outcome: the ordering is fixed by construction.
+    async fn relay_upgraded_request(request: &[u8], response: &[u8], end_marker: EndMarker) {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        const PIPE: usize = 4;
+        let proxy = HttpProxy::new(PassThrough, Arc::new(ServerConf::default()));
+        let (proxy_io, mut origin) = tokio::io::duplex(4096);
+        let mut client_session = HttpSessionV1::new(Box::new(proxy_io));
+        let downstream = request_session(request).await;
+        client_session
+            .write_request_header(Box::new(downstream.req_header().clone()))
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            origin.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+
+        let (tx_up, mut rx_up) = mpsc::channel(PIPE);
+        let (tx_down, rx_down) = mpsc::channel(PIPE);
+        let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
+        let relay = proxy.proxy_handle_upstream(&mut client_session, tx_up, rx_down, pipe_state);
+        tokio::pin!(relay);
+
+        match end_marker {
+            EndMarker::BeforeResponse => {
+                // The relay consumes the marker while no response is readable yet.
+                tx_down.send(HttpTask::Body(None, true)).await.unwrap();
+                while tx_down.capacity() < PIPE {
+                    tokio::select! {
+                        biased;
+                        res = &mut relay => panic!("relay ended on the request end: {res:?}"),
+                        _ = tokio::task::yield_now() => {},
+                    }
+                }
+                origin.write_all(response).await.unwrap();
+            }
+            // The response is readable while the pipe is still empty.
+            EndMarker::AfterResponse => origin.write_all(response).await.unwrap(),
+        }
+
+        // The response switches the upstream connection to raw bytes.
+        let header = tokio::select! {
+            biased;
+            res = &mut relay => panic!("relay ended before the response: {res:?}"),
+            task = rx_up.recv() => task.expect("response header"),
+        };
+        match header {
+            HttpTask::Header(resp, false) => assert!(
+                resp.status == 101 || resp.status.is_success(),
+                "{}",
+                resp.status
+            ),
+            other => panic!("expected the switching response header, got {other:?}"),
+        }
+
+        if let EndMarker::AfterResponse = end_marker {
+            tx_down.send(HttpTask::Body(None, true)).await.unwrap();
+        }
+        tx_down
+            .send(HttpTask::UpgradedBody(
+                Some(Bytes::from_static(b"hello")),
+                false,
+            ))
+            .await
+            .unwrap();
+
+        // The end of the HTTP request is not the end of the tunnel: tunnel
+        // bytes must still reach the origin.
+        let mut tunnel = [0u8; 5];
+        tokio::select! {
+            biased;
+            res = &mut relay => panic!(
+                "{end_marker:?}: tunnel closed on the request end marker: {res:?}"
+            ),
+            read = origin.read_exact(&mut tunnel) => read.unwrap(),
+        };
+        assert_eq!(&tunnel, b"hello", "{end_marker:?}");
+
+        // The tunnel's own end still ends the relay.
+        tx_down
+            .send(HttpTask::UpgradedBody(None, true))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), &mut relay)
+            .await
+            .unwrap_or_else(|_| panic!("{end_marker:?}: relay must end at tunnel EOF"))
+            .unwrap();
+    }
+
+    const WEBSOCKET_REQUEST: &[u8] =
+        b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+
+    #[tokio::test]
+    async fn connect_tunnel_survives_request_end_after_fast_2xx() {
+        relay_upgraded_request(
+            CONNECT_REQUEST,
+            b"HTTP/1.1 200 OK\r\n\r\n",
+            EndMarker::AfterResponse,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn connect_tunnel_survives_request_end_before_2xx() {
+        relay_upgraded_request(
+            CONNECT_REQUEST,
+            b"HTTP/1.1 200 OK\r\n\r\n",
+            EndMarker::BeforeResponse,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upgrade_tunnel_survives_request_end_after_fast_101() {
+        relay_upgraded_request(
+            WEBSOCKET_REQUEST,
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            EndMarker::AfterResponse,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upgrade_tunnel_survives_request_end_before_101() {
+        relay_upgraded_request(
+            WEBSOCKET_REQUEST,
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            EndMarker::BeforeResponse,
+        )
+        .await;
     }
 }
