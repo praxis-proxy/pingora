@@ -116,6 +116,13 @@ where
 
         session.set_upstream_h1_upgrade_request_status(is_h1_upgrade_req(&req));
 
+        // Checked against the final request, after the filters that can change
+        // its method, and before anything is written upstream or downstream.
+        if let Err(e) = reject_unsupported_connect_tunnel(session, &req, "h1") {
+            return (false, true, Some(e));
+        }
+        session.set_upstream_connect_request(&req, true);
+
         session.upstream_compression.request_filter(&req);
 
         debug!("Sending header to upstream {:?}", req);
@@ -398,6 +405,9 @@ where
         /* run filters before sending to downstream */
         let mut filtered_tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
         for mut t in tasks {
+            // Before any filter can change it: the upstream connection already
+            // switched (or not) on this status.
+            session.record_upstream_connect_response(&t);
             if self.revalidate_or_stale(session, &mut t, ctx).await {
                 serve_from_cache.enable();
                 response_state.enable_cached_response();
@@ -1291,6 +1301,121 @@ mod tests {
                 header.headers.get(http::header::TRANSFER_ENCODING)
             );
         }
+    }
+
+    /// A `response_filter` that rewrites the final status.
+    struct StatusRewrite(u16);
+
+    #[async_trait]
+    impl ProxyHttp for StatusRewrite {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("test calls h1_response_filter directly")
+        }
+
+        async fn response_filter(
+            &self,
+            _session: &mut Session,
+            response: &mut ResponseHeader,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            response.set_status(self.0)?;
+            Ok(())
+        }
+    }
+
+    /// Run an upstream CONNECT response through the same steps as
+    /// `process_upstream_tasks` and then the downstream write, with a
+    /// `response_filter` that rewrites the status. Returns the write result and
+    /// whatever reached the client.
+    async fn proxy_connect_response_with_rewrite(
+        upstream_status: u16,
+        rewritten_status: u16,
+    ) -> (Result<bool>, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+
+        let proxy = HttpProxy::new(
+            StatusRewrite(rewritten_status),
+            Arc::new(ServerConf::default()),
+        );
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(CONNECT_REQUEST).await.unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session.read_request().await.unwrap();
+
+        // what proxy_1to1 does just before writing the upstream request
+        let upstream_req = session.req_header().clone();
+        reject_unsupported_connect_tunnel(&session, &upstream_req, "h1").unwrap();
+        session.set_upstream_connect_request(&upstream_req, true);
+
+        // what process_upstream_tasks does with the upstream header task
+        let task = HttpTask::Header(
+            Box::new(ResponseHeader::build(upstream_status, None).unwrap()),
+            false,
+        );
+        session.record_upstream_connect_response(&task);
+        let mut ctx = ();
+        let mut serve_from_cache = ServeFromCache::new();
+        let mut range_body_filter = RangeBodyFilter::new();
+        let task = proxy
+            .h1_response_filter(
+                &mut session,
+                task,
+                &mut ctx,
+                &mut serve_from_cache,
+                &mut range_body_filter,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let result = session.write_response_tasks(vec![task]).await;
+        drop(session);
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        (result, out)
+    }
+
+    #[tokio::test]
+    async fn response_filter_cannot_refuse_an_open_tunnel() {
+        // The upstream connection already switched to tunnel mode on its 200.
+        let (result, out) = proxy_connect_response_with_rewrite(200, 403).await;
+        assert_eq!(result.unwrap_err().etype(), &InvalidHTTPHeader);
+        assert!(out.is_empty(), "nothing may reach the client: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn response_filter_cannot_forge_a_tunnel() {
+        // The upstream refused; a 200 here would claim a tunnel that is not open.
+        let (result, out) = proxy_connect_response_with_rewrite(403, 200).await;
+        assert_eq!(result.unwrap_err().etype(), &InvalidHTTPHeader);
+        assert!(out.is_empty(), "no 2xx may reach the client: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn response_filter_may_keep_the_tunnel_decision() {
+        // Changing the status within the same decision is allowed.
+        let (result, out) = proxy_connect_response_with_rewrite(200, 204).await;
+        result.unwrap();
+        assert!(
+            out.starts_with(b"HTTP/1.1 204"),
+            "{:?}",
+            String::from_utf8_lossy(&out)
+        );
+        let (result, out) = proxy_connect_response_with_rewrite(403, 407).await;
+        result.unwrap();
+        assert!(
+            out.starts_with(b"HTTP/1.1 407"),
+            "{:?}",
+            String::from_utf8_lossy(&out)
+        );
     }
 
     async fn upgrade_request_session() -> Session {

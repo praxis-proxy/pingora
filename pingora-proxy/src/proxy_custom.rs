@@ -111,6 +111,12 @@ where
 
         session.set_upstream_h1_upgrade_request_status(is_h1_upgrade_req(&req));
 
+        // Checked against the final request, before anything is sent upstream.
+        if let Err(e) = reject_unsupported_connect_tunnel(session, &req, "custom") {
+            return (false, Some(e));
+        }
+        session.set_upstream_connect_request(&req, false);
+
         session.upstream_compression.request_filter(&req);
         let body_empty = session.as_mut().is_body_empty();
 
@@ -314,6 +320,7 @@ where
         /* run filters before sending to downstream */
         let mut filtered_tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
         for mut t in tasks {
+            session.record_upstream_connect_response(&t);
             if self.revalidate_or_stale(session, &mut t, ctx).await {
                 serve_from_cache.enable();
                 response_state.enable_cached_response();

@@ -595,6 +595,8 @@ where
     pub upstream_headers_mutated_for_cache: bool,
     /// Upstream predicate for whether this HTTP/1 request is an upgrade.
     h1_upgrade_request_status: H1UpgradeRequestStatus,
+    /// Whether the upstream established a CONNECT tunnel, from its original response.
+    connect_tunnel_status: ConnectTunnelStatus,
     /// The context from parent request, if this is a subrequest.
     pub subrequest_ctx: Option<Box<SubrequestCtx>>,
     /// Handle to allow spawning subrequests, assigned by the `Subrequest` app logic.
@@ -641,6 +643,7 @@ where
             ignore_downstream_range: false,
             upstream_headers_mutated_for_cache: false,
             h1_upgrade_request_status: H1UpgradeRequestStatus::default(),
+            connect_tunnel_status: ConnectTunnelStatus::default(),
             subrequest_ctx: None,
             subrequest_spawner: None, // optionally set later on
             downstream_modules_ctx: downstream_modules.build_ctx(),
@@ -786,7 +789,10 @@ where
                 // is written) keeps header and body tasks in one batch
                 // consistent. Ask the session so this matches what
                 // `was_upgraded()` becomes; an HTTP/2 tunnel stays framed.
-                if self.downstream_session.is_connect_tunnel_resp(resp) {
+                let downstream_tunnel = self.downstream_session.is_connect_tunnel_resp(resp);
+                reject_mismatched_connect_tunnel(self, resp, downstream_tunnel)
+                    .map_err(|e| e.into_in())?;
+                if downstream_tunnel {
                     *seen_upgraded = true;
                 }
             }
@@ -919,6 +925,28 @@ where
         self.h1_upgrade_request_status = H1UpgradeRequestStatus {
             upstream: Some(upstream_is_upgrade_req),
         };
+    }
+
+    /// Record whether the request written upstream is CONNECT and whether that
+    /// upstream connection can switch to a tunnel (only an HTTP/1 one can).
+    fn set_upstream_connect_request(&mut self, req: &RequestHeader, upstream_can_tunnel: bool) {
+        self.connect_tunnel_status = ConnectTunnelStatus {
+            upstream_connect_tunnel_req: Some(req.method == Method::CONNECT && upstream_can_tunnel),
+            upstream_tunnel: None,
+        };
+    }
+
+    /// Record the upstream's own tunnel decision from its final response header,
+    /// before any filter can change the status.
+    fn record_upstream_connect_response(&mut self, task: &HttpTask) {
+        if let HttpTask::Header(resp, _) = task {
+            if let Some(tunnel_req) = self.connect_tunnel_status.upstream_connect_tunnel_req {
+                if !resp.status.is_informational() {
+                    self.connect_tunnel_status.upstream_tunnel =
+                        Some(tunnel_req && resp.status.is_success());
+                }
+            }
+        }
     }
 
     fn h1_upgrade_request_snapshot(&self) -> H1UpgradeRequestSnapshot {
@@ -1092,6 +1120,83 @@ where
         );
     }
     Ok(())
+}
+
+/// The upstream half of a CONNECT tunnel decision.
+#[derive(Clone, Copy, Debug, Default)]
+struct ConnectTunnelStatus {
+    /// Whether the request written upstream is a CONNECT on a connection that
+    /// can switch to a tunnel. `None` until a request is sent upstream.
+    upstream_connect_tunnel_req: Option<bool>,
+    /// Whether the upstream's final response established a tunnel, judged from
+    /// its original status before any filter ran. `None` until that response
+    /// arrives, and for responses that did not come from an upstream.
+    upstream_tunnel: Option<bool>,
+}
+
+/// Rejects a final response header whose tunnel status disagrees with the
+/// upstream's.
+///
+/// The upstream connection switches to tunnel mode as soon as it reads a 2xx to
+/// CONNECT, so its tasks after the header are raw tunnel bytes. A filter that
+/// changes that 2xx into a refusal would send them as a body; one that changes a
+/// refusal into a 2xx would tell the client a tunnel exists that the upstream
+/// never opened. Either is refused before the header is written.
+fn reject_mismatched_connect_tunnel<DS>(
+    session: &Session<DS>,
+    header: &ResponseHeader,
+    downstream_tunnel: bool,
+) -> Result<()>
+where
+    DS: DownstreamSession,
+{
+    if header.status.is_informational() {
+        return Ok(());
+    }
+    match session.connect_tunnel_status.upstream_tunnel {
+        Some(upstream_tunnel) if upstream_tunnel != downstream_tunnel => Error::e_explain(
+            InvalidHTTPHeader,
+            format!(
+                "CONNECT response status changed across the tunnel decision: \
+                 upstream_tunnel={upstream_tunnel}, downstream_tunnel={downstream_tunnel}, \
+                 status={}",
+                header.status
+            ),
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Rejects a CONNECT that would join a tunnel across different protocols.
+///
+/// A CONNECT tunnel is supported HTTP/1 to HTTP/1, where both halves switch to
+/// raw bytes, and HTTP/2 to HTTP/2, where both stay framed. Any other pair would
+/// have one side carry tunnel bytes the other cannot express, so it is refused
+/// with 502 before the request is sent upstream and before any response.
+fn reject_unsupported_connect_tunnel<DS>(
+    session: &Session<DS>,
+    upstream_req: &RequestHeader,
+    upstream: &'static str,
+) -> Result<()>
+where
+    DS: DownstreamSession,
+{
+    if session.req_header().method != Method::CONNECT && upstream_req.method != Method::CONNECT {
+        return Ok(());
+    }
+    let downstream = session.downstream_session.session_type();
+    if connect_tunnel_supported(downstream, upstream) {
+        return Ok(());
+    }
+    Error::e_explain(
+        HTTPStatus(502),
+        format!("unsupported CONNECT tunnel: downstream={downstream}, upstream={upstream}"),
+    )
+}
+
+/// Whether a CONNECT tunnel between these session types is supported.
+fn connect_tunnel_supported(downstream: &str, upstream: &str) -> bool {
+    matches!((downstream, upstream), ("h1", "h1") | ("h2", "h2"))
 }
 
 fn reject_unexpected_task_after_h1_upgrade<DS>(
@@ -2572,6 +2677,171 @@ mod tests {
             "tunnel bytes must be written unframed: {:?}",
             String::from_utf8_lossy(&out)
         );
+    }
+
+    const CONNECT_REQUEST: &[u8] =
+        b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+
+    /// An HTTP/1 CONNECT session whose request was sent to an HTTP/1 upstream
+    /// that answered with `upstream_status`, as recorded before any filter ran.
+    async fn connect_session_after_upstream(
+        upstream_status: u16,
+        written: Arc<Mutex<Vec<u8>>>,
+    ) -> Session {
+        let mut session = new_request_session(CONNECT_REQUEST, written).await;
+        let upstream_req = session.req_header().clone();
+        session.set_upstream_connect_request(&upstream_req, true);
+        session.record_upstream_connect_response(&HttpTask::Header(
+            Box::new(ResponseHeader::build(upstream_status, None).unwrap()),
+            false,
+        ));
+        session
+    }
+
+    // The header is sent alone, as it is when the upstream's header and body
+    // land in different batches: the mismatch must be caught on the header
+    // itself, before it is written, not later on a body task.
+
+    #[tokio::test]
+    async fn write_response_tasks_rejects_tunnel_turned_into_refusal() {
+        // The upstream opened a tunnel (200), so its later tasks are tunnel
+        // bytes; a filter changed the status to 403.
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut session = connect_session_after_upstream(200, written.clone()).await;
+        let mut refusal = ResponseHeader::build(403, None).unwrap();
+        refusal
+            .insert_header(header::TRANSFER_ENCODING, "chunked")
+            .unwrap();
+
+        let err = session
+            .write_response_tasks(vec![HttpTask::Header(Box::new(refusal), false)])
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert_eq!(err.esource(), &ErrorSource::Internal);
+        assert!(written.lock().unwrap().is_empty(), "no header may be sent");
+    }
+
+    #[tokio::test]
+    async fn write_response_tasks_rejects_refusal_turned_into_tunnel() {
+        // The upstream refused (403); a filter changed it to 200, which would
+        // tell the client a tunnel exists that the upstream never opened.
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut session = connect_session_after_upstream(403, written.clone()).await;
+
+        let err = session
+            .write_response_tasks(vec![HttpTask::Header(
+                Box::new(ResponseHeader::build(200, None).unwrap()),
+                false,
+            )])
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert!(
+            !session.was_upgraded(),
+            "the session must not enter tunnel mode"
+        );
+        assert!(written.lock().unwrap().is_empty(), "no 2xx may be sent");
+    }
+
+    #[tokio::test]
+    async fn write_response_tasks_accepts_agreeing_connect_statuses() {
+        for (upstream, downstream, tunnel) in
+            [(200, 200, true), (200, 204, true), (403, 407, false)]
+        {
+            let written = Arc::new(Mutex::new(Vec::new()));
+            let mut session = connect_session_after_upstream(upstream, written.clone()).await;
+            let mut header = ResponseHeader::build(downstream, None).unwrap();
+            if !tunnel {
+                header.insert_header(header::CONTENT_LENGTH, "0").unwrap();
+            }
+            session
+                .write_response_tasks(vec![HttpTask::Header(Box::new(header), !tunnel)])
+                .await
+                .unwrap_or_else(|e| panic!("upstream {upstream} -> {downstream}: {e}"));
+            assert_eq!(
+                session.was_upgraded(),
+                tunnel,
+                "upstream {upstream} -> {downstream}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_response_tasks_skips_connect_check_without_upstream() {
+        // A response the proxy produced itself (no upstream contacted) has no
+        // upstream decision to disagree with.
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut session = new_request_session(CONNECT_REQUEST, written.clone()).await;
+        let mut resp = ResponseHeader::build(403, None).unwrap();
+        resp.insert_header(header::CONTENT_LENGTH, "0").unwrap();
+        session
+            .write_response_tasks(vec![HttpTask::Header(Box::new(resp), true)])
+            .await
+            .unwrap();
+        assert!(written.lock().unwrap().starts_with(b"HTTP/1.1 403"));
+    }
+
+    #[test]
+    fn connect_tunnel_supported_only_within_one_protocol() {
+        for downstream in ["h1", "h2", "subrequest", "custom"] {
+            for upstream in ["h1", "h2", "custom"] {
+                assert_eq!(
+                    connect_tunnel_supported(downstream, upstream),
+                    downstream == upstream && downstream != "custom",
+                    "downstream={downstream}, upstream={upstream}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_connect_tunnel_is_refused_with_502() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let session = new_request_session(CONNECT_REQUEST, written).await;
+        let req = session.req_header().clone();
+
+        reject_unsupported_connect_tunnel(&session, &req, "h1").unwrap();
+        for upstream in ["h2", "custom"] {
+            let err = reject_unsupported_connect_tunnel(&session, &req, upstream).unwrap_err();
+            assert_eq!(err.etype(), &HTTPStatus(502), "h1 -> {upstream}");
+        }
+
+        // A filter that turns a GET into CONNECT is checked too.
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let session =
+            new_request_session(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n", written).await;
+        let mut connect = session.req_header().clone();
+        connect.set_method(Method::CONNECT);
+        assert!(reject_unsupported_connect_tunnel(&session, &connect, "h2").is_err());
+        let get = session.req_header().clone();
+        reject_unsupported_connect_tunnel(&session, &get, "h2").unwrap();
+    }
+
+    #[tokio::test]
+    async fn subrequest_connect_is_refused_before_the_upstream() {
+        // A subrequest session never switches to a tunnel, so a CONNECT through
+        // it to an HTTP/1 upstream would hand it UpgradedBody tasks it cannot
+        // write. It is refused before anything is sent.
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let parent = new_request_session(CONNECT_REQUEST, written).await;
+        let (mut sub, _handle) = subrequest::create_session(&parent.downstream_session);
+        sub.read_request().await.unwrap();
+        let session = Session::new(
+            sub,
+            &HttpModules::new(),
+            #[cfg(feature = "upstream_modules")]
+            &HttpModules::new(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(session.downstream_session.session_type(), "subrequest");
+
+        let req = session.req_header().clone();
+        assert_eq!(req.method, Method::CONNECT);
+        let err = reject_unsupported_connect_tunnel(&session, &req, "h1").unwrap_err();
+        assert_eq!(err.etype(), &HTTPStatus(502));
     }
 
     const CONNECT_GZIP_REQUEST: &[u8] =
