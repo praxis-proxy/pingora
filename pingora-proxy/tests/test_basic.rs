@@ -1022,6 +1022,176 @@ async fn test_connect_proxying_tunnel_round_trip_h1() {
     connect_tunnel_round_trip("").await;
 }
 
+/// An upstream for one CONNECT: it reads the request head, waits `delay`,
+/// writes `response`, then echoes everything that follows. The proxy forwards
+/// client bytes only once the tunnel is open, so early tunnel data reaches it
+/// after the 2xx; the echo returns it in the order it arrived. The delay lets
+/// a test have the client's early bytes reach the proxy while it is still
+/// waiting for this response. Returns the address to put in `X-Port`.
+async fn connect_upstream(
+    response: &'static [u8],
+    delay: std::time::Duration,
+) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let head = read_h1_head(&mut socket).await;
+        let (_, after_head) = head.split_once("\r\n\r\n").unwrap();
+        assert!(
+            after_head.is_empty(),
+            "tunnel bytes must not be forwarded before the tunnel is open: {after_head:?}"
+        );
+        tokio::time::sleep(delay).await;
+        socket.write_all(response).await.unwrap();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            socket.write_all(&buf[..n]).await.unwrap();
+        }
+    });
+    addr
+}
+
+/// Read a CONNECT response head and then exactly `len` tunnel bytes, whether
+/// or not they arrived in the same read as the head.
+async fn read_connect_response(stream: &mut TcpStream, len: usize) -> (String, Vec<u8>) {
+    use std::time::Duration;
+    let deadline = Duration::from_secs(5);
+    let head = tokio::time::timeout(deadline, read_h1_head(stream))
+        .await
+        .expect("CONNECT response head");
+    let (head, after) = head.split_once("\r\n\r\n").unwrap();
+    let mut tunnel = after.as_bytes().to_vec();
+    let mut buf = vec![0u8; len];
+    while tunnel.len() < len {
+        let n = tokio::time::timeout(deadline, stream.read(&mut buf))
+            .await
+            .expect("tunnel bytes")
+            .unwrap();
+        assert_ne!(0, n, "tunnel closed early");
+        tunnel.extend_from_slice(&buf[..n]);
+    }
+    (head.to_owned(), tunnel)
+}
+
+fn connect_request(upstream: std::net::SocketAddr, extra_headers: &str) -> String {
+    format!(
+        "CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\nX-Port: {}\r\n{extra_headers}\r\n",
+        upstream.port()
+    )
+}
+
+#[tokio::test]
+async fn test_connect_tunnel_bytes_in_the_request_head_read() {
+    // The client sends the CONNECT head and the first tunnel bytes in one
+    // write, as a client that does not wait for the response does. The proxy
+    // keeps them until the tunnel is open, then forwards them first.
+    init_proxy().await;
+    let upstream = connect_upstream(
+        b"HTTP/1.1 200 OK\r\n\r\n",
+        std::time::Duration::from_millis(300),
+    )
+    .await;
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    let mut request = connect_request(upstream, "").into_bytes();
+    request.extend_from_slice(b"early");
+    stream.write_all(&request).await.unwrap();
+
+    let (head, tunnel) = read_connect_response(&mut stream, 5).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(tunnel, b"early", "early bytes must reach the origin first");
+}
+
+#[tokio::test]
+async fn test_connect_tunnel_bytes_in_a_later_read() {
+    // Same bytes, split across two writes: the second arrives as its own read,
+    // after the head, while the proxy is waiting on the upstream connection.
+    init_proxy().await;
+    let upstream = connect_upstream(
+        b"HTTP/1.1 200 OK\r\n\r\n",
+        std::time::Duration::from_millis(300),
+    )
+    .await;
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    stream
+        .write_all(connect_request(upstream, "").as_bytes())
+        .await
+        .unwrap();
+    // The upstream answers at 300ms, so this read happens while the proxy is
+    // still waiting for it: the case that failed with "Sent data after end
+    // of body".
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    stream.write_all(b"early").await.unwrap();
+
+    let (head, tunnel) = read_connect_response(&mut stream, 5).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(
+        tunnel, b"early",
+        "result must not depend on how reads split"
+    );
+}
+
+#[tokio::test]
+async fn test_connect_response_and_tunnel_bytes_in_one_read() {
+    // The upstream writes the 200 and tunnel bytes together; the bytes must
+    // reach the client as tunnel data, not as part of the head or a body.
+    init_proxy().await;
+    let upstream = connect_upstream(
+        b"HTTP/1.1 200 OK\r\n\r\nserver-first",
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    stream
+        .write_all(connect_request(upstream, "").as_bytes())
+        .await
+        .unwrap();
+
+    let (head, tunnel) = read_connect_response(&mut stream, 12).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        !head.to_ascii_lowercase().contains("transfer-encoding"),
+        "{head}"
+    );
+    assert_eq!(tunnel, b"server-first");
+}
+
+#[tokio::test]
+async fn test_connect_tunnel_not_compressed() {
+    // gzip on downstream, a client that accepts it, and a 200 that looks
+    // compressible: the tunnel bytes must still pass through raw.
+    init_proxy().await;
+    let upstream = connect_upstream(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nplain text tunnel bytes plain text tunnel bytes",
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    stream
+        .write_all(
+            connect_request(
+                upstream,
+                "X-Downstream-Compression: 1\r\nAccept-Encoding: gzip\r\n",
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let expected = b"plain text tunnel bytes plain text tunnel bytes";
+    let (head, tunnel) = read_connect_response(&mut stream, expected.len()).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        !head.to_ascii_lowercase().contains("content-encoding"),
+        "tunnel head must not claim an encoding: {head}"
+    );
+    assert_eq!(tunnel, expected, "tunnel bytes must not be compressed");
+}
+
 #[tokio::test]
 async fn test_connect_proxying_tunnel_round_trip_h1_proxy_tasks() {
     connect_tunnel_round_trip("X-Proxy-Tasks-Enabled: 1\r\n").await;
