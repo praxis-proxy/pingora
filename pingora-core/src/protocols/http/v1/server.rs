@@ -878,6 +878,11 @@ impl HttpSession {
             header.remove_header(&TRANSFER_ENCODING);
             header.remove_header(&CONTENT_LENGTH);
             self.set_keepalive(None);
+        } else if self.get_method() == Some(&Method::CONNECT) && !header.status.is_informational() {
+            // A refused CONNECT closes the connection. Bytes the client sent
+            // after the head are tunnel data even when they shared its read,
+            // so they must never be reused as a pipelined next request.
+            self.set_keepalive(None);
         }
 
         // no need to add these headers to 1xx responses
@@ -5040,6 +5045,30 @@ mod test_connect_early_data {
         resp.insert_header(CONTENT_LENGTH, "0").unwrap();
         s.write_response_header(Box::new(resp)).await.unwrap();
         assert!(!s.was_upgraded());
+        assert!(s.reuse().await.unwrap().is_none(), "connection must close");
+    }
+
+    #[tokio::test]
+    async fn same_read_early_bytes_close_a_refused_connect() {
+        // Bytes that share the CONNECT head's read land in overread without
+        // the idle stash. A refusal must still close the connection, or with
+        // pipelining on they would be parsed as the next request.
+        let mut input = CONNECT_HEAD.to_vec();
+        input.extend_from_slice(b"GET /x HTTP/1.1\r\nHost: a\r\n\r\n");
+        let mock_io = Builder::new()
+            .read(&input)
+            .write(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
+            .build();
+        let mut s = HttpSession::new(Box::new(mock_io));
+        s.set_pipelining_enabled(true);
+        s.update_resp_headers = false;
+        s.read_request().await.unwrap();
+
+        let mut resp = ResponseHeader::build(407, None).unwrap();
+        resp.insert_header(CONTENT_LENGTH, "0").unwrap();
+        s.write_response_header(Box::new(resp)).await.unwrap();
+        assert!(!s.was_upgraded());
+        assert!(!s.will_keepalive(), "a refused CONNECT disables reuse");
         assert!(s.reuse().await.unwrap().is_none(), "connection must close");
     }
 
