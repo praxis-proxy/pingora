@@ -126,6 +126,29 @@ pub type ShutdownWatch = watch::Receiver<bool>;
 #[cfg(unix)]
 pub type ListenFds = Arc<Mutex<Fds>>;
 
+/// Optional process-owned idle wait used to end a graceful shutdown early.
+///
+/// The callback must return `true` when all accepted work has become idle and
+/// `false` when the supplied deadline expires. The owner is responsible for
+/// synchronizing accept quiescence with its activity count before returning
+/// `true`; a zero activity count alone is not sufficient.
+pub type GracefulShutdownIdle = Arc<dyn Fn(Duration) -> bool + Send + Sync>;
+
+/// Wait for graceful shutdown to become idle, retaining the fixed wait when
+/// no idle callback is installed.
+fn wait_for_graceful_shutdown_idle(
+    idle_wait: Option<&GracefulShutdownIdle>,
+    grace_period: Duration,
+) -> bool {
+    idle_wait.map_or_else(
+        || {
+            thread::sleep(grace_period);
+            false
+        },
+        |wait_for_idle| wait_for_idle(grace_period),
+    )
+}
+
 /// The type of shutdown process that has been requested.
 #[derive(Debug)]
 pub enum ShutdownSignal {
@@ -224,11 +247,24 @@ pub struct Server {
     pub configuration: Arc<ServerConf>,
     /// The parser command line options
     pub options: Option<Opt>,
+
+    /// Optional process-owned idle wait for graceful shutdown.
+    graceful_shutdown_idle: Option<GracefulShutdownIdle>,
 }
 
 // TODO: delete the pid when exit
 
 impl Server {
+    /// Install an optional idle wait for graceful termination.
+    ///
+    /// When no wait is installed, graceful shutdown retains the historical
+    /// fixed grace-period behavior. The callback is invoked only after the
+    /// server has stopped accepting new work and receives the configured grace
+    /// period as its maximum wait.
+    pub fn set_graceful_shutdown_idle(&mut self, idle_wait: GracefulShutdownIdle) {
+        self.graceful_shutdown_idle = Some(idle_wait);
+    }
+
     /// Acquire a receiver for the server's execution phase.
     ///
     /// The receiver will produce values for each transition.
@@ -479,6 +515,7 @@ impl Server {
             options: opt,
             dependencies: Arc::new(Mutex::new(DependencyGraph::new())),
             bootstrap,
+            graceful_shutdown_idle: None,
         }
     }
 
@@ -527,6 +564,7 @@ impl Server {
             options: opt,
             dependencies: Arc::new(Mutex::new(DependencyGraph::new())),
             bootstrap,
+            graceful_shutdown_idle: None,
         })
     }
 
@@ -808,7 +846,12 @@ impl Server {
                 .grace_period_seconds
                 .unwrap_or(EXIT_TIMEOUT);
             info!("Graceful shutdown: grace period {}s starts", exit_timeout);
-            thread::sleep(Duration::from_secs(exit_timeout));
+            let grace_period = Duration::from_secs(exit_timeout);
+            if wait_for_graceful_shutdown_idle(self.graceful_shutdown_idle.as_ref(), grace_period) {
+                info!("Graceful shutdown: accepted work became idle");
+            } else {
+                info!("Graceful shutdown: grace period expired");
+            }
             info!("Graceful shutdown: grace period ends");
         }
 
@@ -892,5 +935,28 @@ mod listen_address_tests {
 
         server.add_service(UnknownService);
         assert_eq!(server.collect_listen_addresses(), None);
+    }
+}
+
+#[cfg(test)]
+mod graceful_shutdown_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn idle_callback_short_circuits_grace_period() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_by_waiter = Arc::clone(&called);
+        let idle_wait: GracefulShutdownIdle = Arc::new(move |grace_period| {
+            assert_eq!(grace_period, Duration::from_secs(30));
+            called_by_waiter.store(true, Ordering::Relaxed);
+            true
+        });
+
+        assert!(wait_for_graceful_shutdown_idle(
+            Some(&idle_wait),
+            Duration::from_secs(30)
+        ));
+        assert!(called.load(Ordering::Relaxed));
     }
 }
