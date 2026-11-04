@@ -267,6 +267,11 @@ impl Server {
         self.graceful_shutdown_idle = Some(idle_wait);
     }
 
+    /// Remove a previously installed idle wait and restore the fixed grace period.
+    pub fn clear_graceful_shutdown_idle(&mut self) {
+        self.graceful_shutdown_idle = None;
+    }
+
     /// Acquire a receiver for the server's execution phase.
     ///
     /// The receiver will produce values for each transition.

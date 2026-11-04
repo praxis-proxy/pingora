@@ -19,8 +19,29 @@ use pingora_core::server::{
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::broadcast;
 
 const GRACE_PERIOD: Duration = Duration::from_secs(10);
+const PHASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn next_phase(phase: &mut broadcast::Receiver<ExecutionPhase>) -> ExecutionPhase {
+    let deadline = Instant::now() + PHASE_TIMEOUT;
+    loop {
+        match phase.try_recv() {
+            Ok(value) => return value,
+            Err(broadcast::error::TryRecvError::Closed) => panic!("execution phase channel closed"),
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                panic!("execution phase receiver lagged by {skipped} messages")
+            }
+            Err(broadcast::error::TryRecvError::Empty) if Instant::now() >= deadline => {
+                panic!("timed out waiting for execution phase")
+            }
+            Err(broadcast::error::TryRecvError::Empty) => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+        }
+    }
+}
 
 #[test]
 fn server_uses_idle_callback_during_graceful_shutdown() {
@@ -43,18 +64,12 @@ fn server_uses_idle_callback_during_graceful_shutdown() {
         server.run(RunArgs::default());
     });
 
+    assert!(matches!(next_phase(&mut phase), ExecutionPhase::Bootstrap));
     assert!(matches!(
-        phase.blocking_recv().unwrap(),
-        ExecutionPhase::Bootstrap
-    ));
-    assert!(matches!(
-        phase.blocking_recv().unwrap(),
+        next_phase(&mut phase),
         ExecutionPhase::BootstrapComplete
     ));
-    assert!(matches!(
-        phase.blocking_recv().unwrap(),
-        ExecutionPhase::Running
-    ));
+    assert!(matches!(next_phase(&mut phase), ExecutionPhase::Running));
     std::thread::sleep(Duration::from_millis(500));
 
     unsafe {
@@ -62,15 +77,15 @@ fn server_uses_idle_callback_during_graceful_shutdown() {
     }
 
     assert!(matches!(
-        phase.blocking_recv().unwrap(),
+        next_phase(&mut phase),
         ExecutionPhase::GracefulTerminate
     ));
     assert!(matches!(
-        phase.blocking_recv().unwrap(),
+        next_phase(&mut phase),
         ExecutionPhase::ShutdownStarted
     ));
     assert!(matches!(
-        phase.blocking_recv().unwrap(),
+        next_phase(&mut phase),
         ExecutionPhase::ShutdownGracePeriod
     ));
     let grace_period_started = Instant::now();
