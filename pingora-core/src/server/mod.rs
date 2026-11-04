@@ -258,9 +258,11 @@ impl Server {
     /// Install an optional idle wait for graceful termination.
     ///
     /// When no wait is installed, graceful shutdown retains the historical
-    /// fixed grace-period behavior. The callback is invoked only after the
-    /// server has stopped accepting new work and receives the configured grace
-    /// period as its maximum wait.
+    /// fixed grace-period behavior. The callback is invoked immediately after
+    /// the shutdown broadcast, without waiting for listeners to stop accepting
+    /// new work, and receives the configured grace period as its maximum wait.
+    /// The callback owner must synchronize accept quiescence with its activity
+    /// count before returning `true`.
     pub fn set_graceful_shutdown_idle(&mut self, idle_wait: GracefulShutdownIdle) {
         self.graceful_shutdown_idle = Some(idle_wait);
     }
@@ -953,10 +955,13 @@ mod graceful_shutdown_tests {
             true
         });
 
-        assert!(wait_for_graceful_shutdown_idle(
-            Some(&idle_wait),
-            Duration::from_secs(30)
-        ));
-        assert!(called.load(Ordering::Relaxed));
+        assert!(
+            wait_for_graceful_shutdown_idle(Some(&idle_wait), Duration::from_secs(30)),
+            "the idle callback should report that work is complete"
+        );
+        assert!(
+            called.load(Ordering::Relaxed),
+            "the idle callback was not invoked"
+        );
     }
 }
