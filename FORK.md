@@ -40,10 +40,18 @@ raises the fork's minimum supported Rust version to
 cache tests that assumed unique timestamps or a
 deterministic TinyLFU admission order.
 
+The 0.11.3 patch release fixes CONNECT tunneling:
+successful responses carry raw tunnel data without
+HTTP/1 framing or compression, early tunnel bytes
+are preserved, and refused HTTP/1 CONNECT requests
+close the connection. It also fixes premature tunnel
+closure when the request-end marker arrives after a
+CONNECT 2xx or WebSocket 101 response.
+
 ## Changes From Upstream
 
 The fork is based on upstream `main` at 4487f7b
-(0.9.0 plus the five commits above) with seven
+(0.9.0 plus the five commits above) with eight
 functional changes:
 
 ### 1. Custom rustls `ServerConfig` support
@@ -144,6 +152,34 @@ still logs every failed downstream handshake at
 `pingora-core/src/protocols/tls/rustls/server.rs`,
 `pingora-core/src/protocols/tls/rustls/stream.rs`
 
+### 8. CONNECT tunnel handling
+
+Any successful (2xx) response to CONNECT switches
+both HTTP/1 sessions to raw tunnel mode. The proxy
+strips HTTP framing headers, flushes the response
+head, bypasses compression, and preserves early
+tunnel bytes in order. Refused HTTP/1 CONNECT
+requests close the connection so those bytes cannot
+be parsed as another request.
+
+HTTP/2-to-HTTP/2 tunnels retain HTTP/2 framing.
+Mixed HTTP/1 and HTTP/2 tunnels, subrequests, and
+custom downstream sessions are rejected with 502.
+HTTP/1 response filters cannot change whether the
+upstream accepted the tunnel. CONNECT proxying still
+requires the `allow_connect_method_proxying` opt-in.
+
+Completing the original HTTP request no longer ends
+an established CONNECT or WebSocket tunnel; only the
+tunnel's own end does.
+
+**Files:** `pingora-core/src/protocols/http/`,
+`pingora-proxy/src/lib.rs`,
+`pingora-proxy/src/proxy_common.rs`,
+`pingora-proxy/src/proxy_h1.rs`,
+`pingora-proxy/src/proxy_h2.rs`,
+`pingora-proxy/src/proxy_custom.rs`
+
 The fork also carries dependency-hygiene changes:
 dropping the unmaintained `derivative` crate,
 replacing the archived `serde_yaml` with `yaml_serde`,
@@ -168,10 +204,59 @@ only `Cargo.toml` package aliasing is needed:
 
 ```toml
 pingora-core = {
-    version = "0.11.2",
+    version = "0.11.3",
     package = "quixotic-plecostomus-core",
 }
 ```
+
+## Releasing the Fork
+
+The Pingora crates share one release version. Previous
+releases used a `release: vX.Y.Z fork` commit, crates.io
+publication, and a `vX.Y.Z` Git tag. There is no
+automated publish workflow or GitHub Release step.
+Fork release notes belong here; `CHANGELOG.md` tracks
+upstream releases.
+
+1. Choose the next version after checking crates.io
+   and the existing tags. Bump all 22 Pingora package
+   versions and every internal dependency requirement
+   together. Update the release notes, consumer example,
+   and provenance table in this file.
+2. Leave `quixotic-plecostomus-rustls-openssl` at its
+   separately versioned release unless the provider
+   itself changed. Keep `pingora-test-utils` unpublished
+   and path-only. `Cargo.lock` is intentionally ignored.
+3. Run the checks in `.github/workflows/build.yml`,
+   including workspace tests and doctests, the rustls
+   tests, formatting, Clippy, dependency audit, and
+   unused-dependency checks. Check the Rust 1.88 build
+   and the provider's FIPS CI result. Integration tests
+   require the OpenResty version pinned in that workflow.
+   TLS backends must be tested separately; do not enable
+   all TLS features together.
+4. Commit the preparation on `main` with a signed,
+   signed-off release commit. With Cargo 1.97.1 (the
+   pinned stable CI version), verify all release archives
+   from the clean commit without uploading:
+
+   ```sh
+   cargo publish --dry-run --workspace \
+     --exclude pingora-test-utils \
+     --exclude quixotic-plecostomus-rustls-openssl
+   ```
+
+   Cargo stages the selected workspace packages locally
+   so unpublished internal versions can be verified
+   together. Keep verification enabled; do not use
+   `--no-verify` or substitute older dependency versions.
+5. After publication is approved, run the same command
+   without `--dry-run`. Cargo publishes dependencies
+   before their dependents. Confirm all 22 versions are
+   available on crates.io, tag the release commit as
+   `vX.Y.Z`, and push `main` and that tag to `origin`.
+   If the provider also needs a release, include its new
+   version in both the dry run and publication.
 
 ## Upstream Plan
 
@@ -191,7 +276,7 @@ first-class dependency with clear provenance.
 | **Org fork** | https://github.com/praxis-proxy/pingora |
 | **Base** | upstream `main` at 4487f7b (0.9.0 + 5 commits) |
 | **License** | Apache 2.0 (unchanged from upstream) |
-| **crates.io** | `quixotic-plecostomus-*` v0.11.2 (pingora crates); `quixotic-plecostomus-rustls-openssl` v0.4.1 |
+| **Fork version** | `quixotic-plecostomus-*` v0.11.3 (pingora crates); `quixotic-plecostomus-rustls-openssl` v0.4.1 |
 
 [upstream]: https://github.com/cloudflare/pingora
 [rustls-openssl]: https://github.com/tofay/rustls-openssl
