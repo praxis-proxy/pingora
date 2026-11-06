@@ -381,6 +381,10 @@ where
     fn listen_addresses(&self) -> Option<Vec<String>> {
         Some(self.listeners.addresses())
     }
+
+    fn is_listening(&self) -> bool {
+        true
+    }
 }
 
 /// Whether a failed downstream handshake only means the client went away.
