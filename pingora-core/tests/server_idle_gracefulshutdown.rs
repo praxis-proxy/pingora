@@ -31,6 +31,7 @@ use tokio::sync::oneshot;
 const GRACE_PERIOD: Duration = Duration::from_secs(10);
 const PHASE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Wait for the next execution phase, failing if none arrives before the timeout.
 fn next_phase(phase: &mut broadcast::Receiver<ExecutionPhase>) -> ExecutionPhase {
     let deadline = Instant::now() + PHASE_TIMEOUT;
     loop {
@@ -50,6 +51,7 @@ fn next_phase(phase: &mut broadcast::Receiver<ExecutionPhase>) -> ExecutionPhase
     }
 }
 
+/// Assert that the next execution phase matches the expected phase.
 fn assert_phase(phase: &mut broadcast::Receiver<ExecutionPhase>, expected: ExecutionPhase) {
     let actual = next_phase(phase);
     assert_eq!(
@@ -67,6 +69,7 @@ struct TestShutdownSignal {
 
 #[cfg(unix)]
 impl TestShutdownSignal {
+    /// Create a shutdown watch that fires once the test releases it.
     fn new(release: oneshot::Receiver<()>) -> Self {
         Self {
             release: Mutex::new(Some(release)),
@@ -77,6 +80,7 @@ impl TestShutdownSignal {
 #[cfg(unix)]
 #[async_trait::async_trait]
 impl ShutdownSignalWatch for TestShutdownSignal {
+    /// Wait for the test to release shutdown, then request graceful termination.
     async fn recv(&self) -> ShutdownSignal {
         let release = self.release.lock().unwrap().take();
         if let Some(release) = release {
@@ -86,6 +90,7 @@ impl ShutdownSignalWatch for TestShutdownSignal {
     }
 }
 
+/// Graceful shutdown ends early when the installed idle callback reports idle.
 #[cfg(unix)]
 #[test]
 fn server_uses_idle_callback_during_graceful_shutdown() {

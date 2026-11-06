@@ -950,6 +950,7 @@ mod graceful_shutdown_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// The idle callback short-circuits the fixed grace-period wait.
     #[test]
     fn idle_callback_short_circuits_grace_period() {
         let called = Arc::new(AtomicBool::new(false));
