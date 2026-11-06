@@ -10,16 +10,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// NOTE: This test sends a shutdown signal to itself, so it needs to be an
-// isolated test to prevent concurrency.
+// NOTE: RunArgs carries a shutdown watch only on Unix, so this test is
+// Unix-only. It releases a test-controlled watch instead of raising a process
+// signal, so shutdown delivery cannot race signal-listener registration.
 
 use pingora_core::server::{
     configuration::ServerConf, ExecutionPhase, GracefulShutdownIdle, RunArgs, Server,
 };
+#[cfg(unix)]
+use pingora_core::server::{ShutdownSignal, ShutdownSignalWatch};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
+#[cfg(unix)]
+use tokio::sync::oneshot;
 
 const GRACE_PERIOD: Duration = Duration::from_secs(10);
 const PHASE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -43,6 +50,43 @@ fn next_phase(phase: &mut broadcast::Receiver<ExecutionPhase>) -> ExecutionPhase
     }
 }
 
+fn assert_phase(phase: &mut broadcast::Receiver<ExecutionPhase>, expected: ExecutionPhase) {
+    let actual = next_phase(phase);
+    assert_eq!(
+        std::mem::discriminant(&actual),
+        std::mem::discriminant(&expected),
+        "expected {expected:?} phase, got {actual:?}"
+    );
+}
+
+/// A shutdown watch the test releases once the server is running.
+#[cfg(unix)]
+struct TestShutdownSignal {
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+#[cfg(unix)]
+impl TestShutdownSignal {
+    fn new(release: oneshot::Receiver<()>) -> Self {
+        Self {
+            release: Mutex::new(Some(release)),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl ShutdownSignalWatch for TestShutdownSignal {
+    async fn recv(&self) -> ShutdownSignal {
+        let release = self.release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        ShutdownSignal::GracefulTerminate
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn server_uses_idle_callback_during_graceful_shutdown() {
     let callback_grace_period = Arc::new(AtomicU64::new(0));
@@ -58,41 +102,28 @@ fn server_uses_idle_callback_during_graceful_shutdown() {
     let mut server = Server::new_with_opt_and_conf(None, conf);
     server.set_graceful_shutdown_idle(idle_wait);
     let mut phase = server.watch_execution_phase();
+    let (release_tx, release_rx) = oneshot::channel();
 
     let join = std::thread::spawn(move || {
         server.bootstrap();
-        server.run(RunArgs::default());
+        server.run(RunArgs {
+            shutdown_signal: Box::new(TestShutdownSignal::new(release_rx)),
+        });
     });
 
-    assert!(matches!(next_phase(&mut phase), ExecutionPhase::Bootstrap));
-    assert!(matches!(
-        next_phase(&mut phase),
-        ExecutionPhase::BootstrapComplete
-    ));
-    assert!(matches!(next_phase(&mut phase), ExecutionPhase::Running));
-    std::thread::sleep(Duration::from_millis(500));
+    assert_phase(&mut phase, ExecutionPhase::Bootstrap);
+    assert_phase(&mut phase, ExecutionPhase::BootstrapComplete);
+    assert_phase(&mut phase, ExecutionPhase::Running);
 
-    unsafe {
-        libc::raise(libc::SIGTERM);
-    }
+    release_tx
+        .send(())
+        .expect("the shutdown watch should still be waiting");
 
-    assert!(matches!(
-        next_phase(&mut phase),
-        ExecutionPhase::GracefulTerminate
-    ));
-    assert!(matches!(
-        next_phase(&mut phase),
-        ExecutionPhase::ShutdownStarted
-    ));
-    assert!(matches!(
-        next_phase(&mut phase),
-        ExecutionPhase::ShutdownGracePeriod
-    ));
+    assert_phase(&mut phase, ExecutionPhase::GracefulTerminate);
+    assert_phase(&mut phase, ExecutionPhase::ShutdownStarted);
+    assert_phase(&mut phase, ExecutionPhase::ShutdownGracePeriod);
     let grace_period_started = Instant::now();
-    assert!(matches!(
-        phase.blocking_recv().unwrap(),
-        ExecutionPhase::ShutdownRuntimes
-    ));
+    assert_phase(&mut phase, ExecutionPhase::ShutdownRuntimes);
     let callback_wait = grace_period_started.elapsed();
 
     join.join().unwrap();
