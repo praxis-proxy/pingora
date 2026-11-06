@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use daemon::daemonize;
 use daggy::NodeIndex;
 use log::{error, info, warn};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 #[cfg(all(feature = "dial9", feature = "dial9-worker-s3"))]
 pub use pingora_runtime::Dial9S3UploadOpts;
 use pingora_runtime::{BlockingPoolOpts, Runtime, RuntimeBuilder};
@@ -129,24 +129,133 @@ pub type ListenFds = Arc<Mutex<Fds>>;
 /// Optional process-owned idle wait used to end a graceful shutdown early.
 ///
 /// The callback must return `true` when all accepted work has become idle and
-/// `false` when the supplied deadline expires. The owner is responsible for
-/// synchronizing accept quiescence with its activity count before returning
-/// `true`; a zero activity count alone is not sufficient.
+/// `false` when the supplied deadline expires. The server waits for its
+/// listening services to stop accepting new connections before invoking the
+/// callback, so a zero activity count means the accepted work really is all
+/// that is left. The callback runs on its own thread with the remaining grace
+/// period as its deadline: a callback that panics or overruns the deadline is
+/// treated as "not idle" and cannot delay the shutdown.
 pub type GracefulShutdownIdle = Arc<dyn Fn(Duration) -> bool + Send + Sync>;
+
+/// Tracks listening services until they stop accepting new connections.
+///
+/// A graceful shutdown only broadcasts the shutdown signal: each accept loop
+/// observes it asynchronously and can still accept a connection after the
+/// broadcast. The server drains this tracker before it asks the idle callback
+/// whether accepted work has finished, so the callback cannot see a zero
+/// activity count while a connection is still being accepted.
+#[derive(Clone, Default)]
+struct AcceptQuiescence {
+    inner: Arc<AcceptQuiescenceInner>,
+}
+
+/// Shared state of an [`AcceptQuiescence`].
+#[derive(Default)]
+struct AcceptQuiescenceInner {
+    /// Listening services that have not stopped accepting yet.
+    remaining: Mutex<usize>,
+    /// Notified whenever `remaining` reaches zero.
+    drained: Condvar,
+}
+
+impl AcceptQuiescence {
+    /// Track a listening service that is about to start accepting.
+    ///
+    /// The returned guard marks the service as stopped when it is dropped,
+    /// including when the service panics.
+    fn track_service(&self) -> AcceptQuiescenceGuard {
+        *self.inner.remaining.lock() += 1;
+        AcceptQuiescenceGuard {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Wait until every tracked service stopped accepting, or `timeout` passes.
+    ///
+    /// Returns `true` when no tracked service is left accepting.
+    fn wait_for(&self, timeout: Duration) -> bool {
+        let mut remaining = self.inner.remaining.lock();
+        let started = Instant::now();
+        loop {
+            if *remaining == 0 {
+                return true;
+            }
+            let left = timeout.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return false;
+            }
+            self.inner.drained.wait_for(&mut remaining, left);
+        }
+    }
+}
+
+/// Marks a listening service as stopped accepting once dropped.
+struct AcceptQuiescenceGuard {
+    inner: Arc<AcceptQuiescenceInner>,
+}
+
+impl Drop for AcceptQuiescenceGuard {
+    fn drop(&mut self) {
+        let mut remaining = self.inner.remaining.lock();
+        *remaining = remaining.saturating_sub(1);
+        if *remaining == 0 {
+            self.inner.drained.notify_all();
+        }
+    }
+}
 
 /// Wait for graceful shutdown to become idle, retaining the fixed wait when
 /// no idle callback is installed.
+///
+/// The whole wait, including accept quiescence, is bounded by `grace_period`.
 fn wait_for_graceful_shutdown_idle(
     idle_wait: Option<&GracefulShutdownIdle>,
+    accept_quiescence: &AcceptQuiescence,
     grace_period: Duration,
 ) -> bool {
-    idle_wait.map_or_else(
-        || {
-            thread::sleep(grace_period);
-            false
-        },
-        |wait_for_idle| wait_for_idle(grace_period),
-    )
+    let started = Instant::now();
+    let Some(idle_wait) = idle_wait else {
+        thread::sleep(grace_period);
+        return false;
+    };
+
+    if !accept_quiescence.wait_for(grace_period) {
+        info!("Graceful shutdown: listeners still accepting at grace period expiry");
+        return false;
+    }
+    let remaining = grace_period.saturating_sub(started.elapsed());
+    run_idle_callback(idle_wait, remaining)
+}
+
+/// Run the idle callback with a hard deadline and panic isolation.
+///
+/// The callback runs on its own thread so that a callback which ignores its
+/// deadline cannot delay the shutdown and a panic in it cannot unwind the
+/// shutdown path. A callback that overruns the deadline is abandoned; the
+/// process is exiting anyway.
+fn run_idle_callback(idle_wait: &GracefulShutdownIdle, grace_period: Duration) -> bool {
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let idle_wait = Arc::clone(idle_wait);
+    let spawned = thread::Builder::new()
+        .name("graceful-shutdown-idle".to_string())
+        .spawn(move || {
+            let idle =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| idle_wait(grace_period)))
+                    .unwrap_or_else(|_| {
+                        error!("Graceful shutdown: idle callback panicked, treating work as busy");
+                        false
+                    });
+            // The receiver is gone when the deadline already passed.
+            let _ = result_tx.send(idle);
+        });
+    if spawned.is_err() {
+        error!("Graceful shutdown: unable to start the idle callback thread");
+        return false;
+    }
+    result_rx.recv_timeout(grace_period).unwrap_or_else(|e| {
+        warn!("Graceful shutdown: idle callback did not answer within {grace_period:?}: {e}");
+        false
+    })
 }
 
 /// The type of shutdown process that has been requested.
@@ -258,11 +367,11 @@ impl Server {
     /// Install an optional idle wait for graceful termination.
     ///
     /// When no wait is installed, graceful shutdown retains the historical
-    /// fixed grace-period behavior. The callback is invoked immediately after
-    /// the shutdown broadcast, without waiting for listeners to stop accepting
-    /// new work, and receives the configured grace period as its maximum wait.
-    /// The callback owner must synchronize accept quiescence with its activity
-    /// count before returning `true`.
+    /// fixed grace-period behavior. The callback is invoked after the shutdown
+    /// broadcast and after every listening service has stopped accepting new
+    /// connections, and receives the remaining part of the configured grace
+    /// period as its maximum wait. It runs on its own thread; a callback that
+    /// panics or overruns its deadline is treated as "not idle".
     pub fn set_graceful_shutdown_idle(&mut self, idle_wait: GracefulShutdownIdle) {
         self.graceful_shutdown_idle = Some(idle_wait);
     }
@@ -441,6 +550,7 @@ impl Server {
         dependency_watches: Vec<ServiceReadyWatch>,
         blocking_opts: BlockingPoolOpts,
         runtime_opts: RuntimeOpts,
+        accept_quiescence: Option<AcceptQuiescenceGuard>,
     ) -> Runtime
 // NOTE: we need to keep the runtime outside async since
         // otherwise the runtime will be dropped.
@@ -454,6 +564,8 @@ impl Server {
         );
         let service_name = service.name().to_string();
         service_runtime.get_handle().spawn(async move {
+            // Held until the service stops accepting, even when it panics.
+            let _accept_quiescence = accept_quiescence;
             // Wait for all dependencies to be ready
             let mut time_waited_opt: Option<Duration> = None;
             for mut watch in dependency_watches {
@@ -756,6 +868,11 @@ impl Server {
             .collect();
         info!("Starting services in dependency order: {:?}", service_names);
 
+        // Tracks the services that own listeners so that graceful shutdown can
+        // wait for them to stop accepting before it asks the idle callback
+        // whether accepted work is idle.
+        let accept_quiescence = AcceptQuiescence::default();
+
         // Start services in dependency order
         for (service_id, service) in startup_order {
             let mut wrapper = match self.services.remove(&service_id) {
@@ -804,6 +921,11 @@ impl Server {
                 .map(|s| s.ready_watch.clone())
                 .collect::<Vec<_>>();
 
+            let service_quiescence = wrapper
+                .service
+                .is_listening()
+                .then(|| accept_quiescence.track_service());
+
             let runtime = Server::run_service(
                 wrapper.service,
                 #[cfg(unix)]
@@ -816,6 +938,7 @@ impl Server {
                 dependency_watches,
                 blocking_opts.clone(),
                 service_runtime_opts,
+                service_quiescence,
             );
             runtimes.push((runtime, name));
         }
@@ -854,7 +977,11 @@ impl Server {
                 .unwrap_or(EXIT_TIMEOUT);
             info!("Graceful shutdown: grace period {}s starts", exit_timeout);
             let grace_period = Duration::from_secs(exit_timeout);
-            if wait_for_graceful_shutdown_idle(self.graceful_shutdown_idle.as_ref(), grace_period) {
+            if wait_for_graceful_shutdown_idle(
+                self.graceful_shutdown_idle.as_ref(),
+                &accept_quiescence,
+                grace_period,
+            ) {
                 info!("Graceful shutdown: accepted work became idle");
             } else {
                 info!("Graceful shutdown: grace period expired");
@@ -948,26 +1075,111 @@ mod listen_address_tests {
 #[cfg(test)]
 mod graceful_shutdown_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     /// The idle callback short-circuits the fixed grace-period wait.
     #[test]
     fn idle_callback_short_circuits_grace_period() {
         let called = Arc::new(AtomicBool::new(false));
         let called_by_waiter = Arc::clone(&called);
+        let budget_millis = Arc::new(AtomicU64::new(0));
+        let budget_by_waiter = Arc::clone(&budget_millis);
         let idle_wait: GracefulShutdownIdle = Arc::new(move |grace_period| {
-            assert_eq!(grace_period, Duration::from_secs(30));
+            budget_by_waiter.store(
+                u64::try_from(grace_period.as_millis()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
             called_by_waiter.store(true, Ordering::Relaxed);
             true
         });
 
         assert!(
-            wait_for_graceful_shutdown_idle(Some(&idle_wait), Duration::from_secs(30)),
+            wait_for_graceful_shutdown_idle(
+                Some(&idle_wait),
+                &AcceptQuiescence::default(),
+                Duration::from_secs(30),
+            ),
             "the idle callback should report that work is complete"
         );
         assert!(
             called.load(Ordering::Relaxed),
             "the idle callback was not invoked"
+        );
+        let budget = budget_millis.load(Ordering::Relaxed);
+        assert!(
+            (1..=30_000).contains(&budget),
+            "the idle callback received {budget}ms, expected at most the grace period"
+        );
+    }
+
+    /// The idle callback waits for listeners to stop accepting new work.
+    #[test]
+    fn idle_callback_waits_for_accept_quiescence() {
+        let accept_quiescence = AcceptQuiescence::default();
+        let accepting = accept_quiescence.track_service();
+        let called = Arc::new(AtomicBool::new(false));
+        let called_by_waiter = Arc::clone(&called);
+        let idle_wait: GracefulShutdownIdle = Arc::new(move |_| {
+            called_by_waiter.store(true, Ordering::Relaxed);
+            true
+        });
+
+        assert!(
+            !wait_for_graceful_shutdown_idle(
+                Some(&idle_wait),
+                &accept_quiescence,
+                Duration::from_millis(100),
+            ),
+            "shutdown should not report idle while a listener is still accepting"
+        );
+        assert!(
+            !called.load(Ordering::Relaxed),
+            "the idle callback ran before the listener stopped accepting"
+        );
+
+        // The listener stops accepting after the grace period expired.
+        drop(accepting);
+        assert!(
+            accept_quiescence.wait_for(Duration::ZERO),
+            "a drained tracker reports quiescence immediately"
+        );
+    }
+
+    /// A panicking idle callback cannot unwind the shutdown path.
+    #[test]
+    fn idle_callback_panic_is_not_idle() {
+        let idle_wait: GracefulShutdownIdle = Arc::new(|_| panic!("idle callback failed"));
+
+        assert!(
+            !wait_for_graceful_shutdown_idle(
+                Some(&idle_wait),
+                &AcceptQuiescence::default(),
+                Duration::from_millis(100),
+            ),
+            "a panicking idle callback should be treated as not idle"
+        );
+    }
+
+    /// A callback that ignores its deadline cannot delay the shutdown.
+    #[test]
+    fn idle_callback_is_bounded_by_grace_period() {
+        let idle_wait: GracefulShutdownIdle = Arc::new(|_| {
+            thread::sleep(Duration::from_millis(500));
+            true
+        });
+
+        let started = Instant::now();
+        assert!(
+            !wait_for_graceful_shutdown_idle(
+                Some(&idle_wait),
+                &AcceptQuiescence::default(),
+                Duration::from_millis(50),
+            ),
+            "an overrunning idle callback should be treated as not idle"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "shutdown waited for the whole callback instead of its deadline"
         );
     }
 }

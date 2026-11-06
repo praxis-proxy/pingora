@@ -18,7 +18,11 @@ use pingora_core::server::{
     configuration::ServerConf, ExecutionPhase, GracefulShutdownIdle, RunArgs, Server,
 };
 #[cfg(unix)]
-use pingora_core::server::{ShutdownSignal, ShutdownSignalWatch};
+use pingora_core::server::{ShutdownSignal, ShutdownSignalWatch, ShutdownWatch};
+#[cfg(unix)]
+use pingora_core::services::{ServiceReadyNotifier, ServiceWithDependents};
+#[cfg(unix)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 #[cfg(unix)]
@@ -94,10 +98,13 @@ impl ShutdownSignalWatch for TestShutdownSignal {
 #[cfg(unix)]
 #[test]
 fn server_uses_idle_callback_during_graceful_shutdown() {
-    let callback_grace_period = Arc::new(AtomicU64::new(0));
-    let callback_grace_period_writer = Arc::clone(&callback_grace_period);
+    let callback_budget_millis = Arc::new(AtomicU64::new(0));
+    let callback_budget_writer = Arc::clone(&callback_budget_millis);
     let idle_wait: GracefulShutdownIdle = Arc::new(move |grace_period| {
-        callback_grace_period_writer.store(grace_period.as_secs(), Ordering::SeqCst);
+        callback_budget_writer.store(
+            u64::try_from(grace_period.as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
         true
     });
     let conf = ServerConf {
@@ -133,13 +140,102 @@ fn server_uses_idle_callback_during_graceful_shutdown() {
 
     join.join().unwrap();
 
-    assert_eq!(
-        callback_grace_period.load(Ordering::SeqCst),
-        GRACE_PERIOD.as_secs(),
-        "the idle callback should receive the configured grace period"
+    let callback_budget = callback_budget_millis.load(Ordering::SeqCst);
+    let grace_period_millis = u64::try_from(GRACE_PERIOD.as_millis()).unwrap_or(u64::MAX);
+    assert!(
+        (1..=grace_period_millis).contains(&callback_budget),
+        "the idle callback should receive the remaining grace period, got {callback_budget}ms"
     );
     assert!(
         callback_wait < GRACE_PERIOD,
         "the idle callback should allow shutdown before the full grace period"
+    );
+}
+
+/// A listening service that keeps accepting for a while after the shutdown
+/// broadcast, the way a real accept loop observes the signal asynchronously.
+#[cfg(unix)]
+struct SlowStopService {
+    stopped: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl ServiceWithDependents for SlowStopService {
+    async fn start_service(
+        &mut self,
+        #[cfg(unix)] _fds: Option<pingora_core::server::ListenFds>,
+        mut shutdown: ShutdownWatch,
+        _listeners_per_fd: usize,
+        ready_notifier: ServiceReadyNotifier,
+    ) {
+        ready_notifier.notify_ready();
+        let _ = shutdown.changed().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    fn name(&self) -> &str {
+        "slow-stop"
+    }
+
+    fn is_listening(&self) -> bool {
+        true
+    }
+}
+
+/// The idle callback only runs once listeners stopped accepting new work.
+#[cfg(unix)]
+#[test]
+fn server_waits_for_listeners_before_idle_callback() {
+    let stopped = Arc::new(AtomicBool::new(false));
+    let observed_stopped = Arc::new(AtomicBool::new(false));
+    let stopped_by_callback = Arc::clone(&stopped);
+    let observed_by_callback = Arc::clone(&observed_stopped);
+    let idle_wait: GracefulShutdownIdle = Arc::new(move |_| {
+        observed_by_callback.store(stopped_by_callback.load(Ordering::SeqCst), Ordering::SeqCst);
+        true
+    });
+    let conf = ServerConf {
+        grace_period_seconds: Some(GRACE_PERIOD.as_secs()),
+        ..Default::default()
+    };
+    let mut server = Server::new_with_opt_and_conf(None, conf);
+    server.set_graceful_shutdown_idle(idle_wait);
+    server.add_service(SlowStopService {
+        stopped: Arc::clone(&stopped),
+    });
+    let mut phase = server.watch_execution_phase();
+    let (release_tx, release_rx) = oneshot::channel();
+
+    let join = std::thread::spawn(move || {
+        server.bootstrap();
+        server.run(RunArgs {
+            shutdown_signal: Box::new(TestShutdownSignal::new(release_rx)),
+        });
+    });
+
+    assert_phase(&mut phase, ExecutionPhase::Bootstrap);
+    assert_phase(&mut phase, ExecutionPhase::BootstrapComplete);
+    assert_phase(&mut phase, ExecutionPhase::Running);
+
+    release_tx
+        .send(())
+        .expect("the shutdown watch should still be waiting");
+
+    assert_phase(&mut phase, ExecutionPhase::GracefulTerminate);
+    assert_phase(&mut phase, ExecutionPhase::ShutdownStarted);
+    assert_phase(&mut phase, ExecutionPhase::ShutdownGracePeriod);
+    assert_phase(&mut phase, ExecutionPhase::ShutdownRuntimes);
+
+    join.join().unwrap();
+
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the listening service should have stopped accepting"
+    );
+    assert!(
+        observed_stopped.load(Ordering::SeqCst),
+        "the idle callback ran before the listener stopped accepting"
     );
 }

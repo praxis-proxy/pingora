@@ -351,6 +351,11 @@ pub trait ServiceWithDependents: Send + Sync {
     fn listen_addresses(&self) -> Option<Vec<String>> {
         None
     }
+
+    /// See [`Service::is_listening`].
+    fn is_listening(&self) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -396,6 +401,10 @@ where
 
     fn listen_addresses(&self) -> Option<Vec<String>> {
         S::listen_addresses(self)
+    }
+
+    fn is_listening(&self) -> bool {
+        S::is_listening(self)
     }
 }
 
@@ -466,6 +475,15 @@ pub trait Service: Sync + Send {
     /// default) if the service may consume fds without declaring every key; this disables cleanup.
     fn listen_addresses(&self) -> Option<Vec<String>> {
         None
+    }
+
+    /// Whether this service accepts new connections on listeners it owns.
+    ///
+    /// Graceful shutdown waits for services that return `true` to stop
+    /// accepting before it asks the idle callback whether accepted work has
+    /// finished. Return `true` from a service that runs its own accept loop.
+    fn is_listening(&self) -> bool {
+        false
     }
 }
 
