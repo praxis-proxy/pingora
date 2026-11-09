@@ -48,10 +48,18 @@ close the connection. It also fixes premature tunnel
 closure when the request-end marker arrives after a
 CONNECT 2xx or WebSocket 101 response.
 
+The 0.11.4 patch release requires `h2` 0.4.20 or
+newer, bringing its HTTP/2 protocol validation,
+stream limit accounting, flow control, and shutdown
+fixes. It also adds an optional idle callback that
+lets graceful termination finish once listeners have
+stopped accepting and accepted work is idle, while
+retaining the configured grace period as a deadline.
+
 ## Changes From Upstream
 
 The fork is based on upstream `main` at 4487f7b
-(0.9.0 plus the five commits above) with eight
+(0.9.0 plus the five commits above) with nine
 functional changes:
 
 ### 1. Custom rustls `ServerConfig` support
@@ -180,6 +188,25 @@ tunnel's own end does.
 `pingora-proxy/src/proxy_h2.rs`,
 `pingora-proxy/src/proxy_custom.rs`
 
+### 9. Graceful termination when idle
+
+Adds `Server::set_graceful_shutdown_idle()` and
+`Server::clear_graceful_shutdown_idle()` so an
+application can finish graceful termination as soon
+as its accepted work becomes idle. Listening services
+stop accepting before the callback runs; custom
+services can opt into this tracking through
+`Service::is_listening()`.
+
+The callback receives the remaining grace period.
+A callback that panics or overruns that deadline
+cannot delay shutdown. Without a callback, the
+existing fixed grace-period behavior is preserved.
+
+**Files:** `pingora-core/src/server/mod.rs`,
+`pingora-core/src/services/mod.rs`,
+`pingora-core/src/services/listening.rs`
+
 The fork also carries dependency-hygiene changes:
 dropping the unmaintained `derivative` crate,
 replacing the archived `serde_yaml` with `yaml_serde`,
@@ -204,7 +231,7 @@ only `Cargo.toml` package aliasing is needed:
 
 ```toml
 pingora-core = {
-    version = "0.11.3",
+    version = "0.11.4",
     package = "quixotic-plecostomus-core",
 }
 ```
@@ -276,7 +303,7 @@ first-class dependency with clear provenance.
 | **Org fork** | https://github.com/praxis-proxy/pingora |
 | **Base** | upstream `main` at 4487f7b (0.9.0 + 5 commits) |
 | **License** | Apache 2.0 (unchanged from upstream) |
-| **Fork version** | `quixotic-plecostomus-*` v0.11.3 (pingora crates); `quixotic-plecostomus-rustls-openssl` v0.4.1 |
+| **Fork version** | `quixotic-plecostomus-*` v0.11.4 (pingora crates); `quixotic-plecostomus-rustls-openssl` v0.4.1 |
 
 [upstream]: https://github.com/cloudflare/pingora
 [rustls-openssl]: https://github.com/tofay/rustls-openssl
