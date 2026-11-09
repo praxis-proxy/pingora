@@ -1923,6 +1923,66 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_req_empty_content_length_rejected() {
+        let (client, server) = duplex(65536);
+
+        let client_task = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut h2 = h2.ready().await.unwrap();
+
+            // h2 parses an empty value as 0 and accepts the stream, so
+            // Pingora's Content-Length validation is what rejects it.
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("https://www.example.com/")
+                .header("content-length", "")
+                .body(())
+                .unwrap();
+
+            let (response, _) = h2.send_request(request, true).unwrap();
+            let err = response.await.unwrap_err();
+            assert_eq!(err.reason(), Some(h2::Reason::PROTOCOL_ERROR));
+            // Dropping `h2` lets the connection close so the server loop exits.
+        });
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+        let mut malformed_streams = 0usize;
+
+        let accepted = HttpSession::from_h2_conn_with_malformed_budget(
+            &mut connection,
+            digest.clone(),
+            &mut malformed_streams,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(accepted, Some(H2Accept::Rejected)),
+            "empty Content-Length must be rejected by Pingora"
+        );
+        assert_eq!(malformed_streams, 1);
+
+        // Keep driving the connection so the reset reaches the client.
+        let done = timeout(
+            Duration::from_secs(1),
+            HttpSession::from_h2_conn_with_malformed_budget(
+                &mut connection,
+                digest,
+                &mut malformed_streams,
+            ),
+        )
+        .await
+        .expect("from_h2_conn hung after rejecting malformed request")
+        .expect("from_h2_conn returned an error after rejecting malformed request");
+        assert!(done.is_none(), "connection should close after rejection");
+
+        client_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_req_content_length_eq_0_and_no_header_eos() {
         let (client, server) = duplex(65536);
 
