@@ -24,7 +24,7 @@ use pingora_core::protocols::http::authority::{
     raw_target_authority, validate_request_authority, RawTargetAuthority,
 };
 use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
-use pingora_core::protocols::http::v2::{client::Http2Session, write_body};
+use pingora_core::protocols::http::v2::client::Http2Session;
 
 /// Derive H2 `:path`, separating H1 absolute-form components ([RFC 9113 section 8.3.1]).
 ///
@@ -1099,18 +1099,7 @@ where
 
         let pacer = self.inner.request_body_pacer(session, data.len(), ctx);
         let mut pending = RequestBodyTask::new(HttpTask::Body(Some(data), end), pacer);
-        let write = async {
-            while !pending.done() {
-                let (task, bytes) = pending.next().await?;
-                if let HttpTask::Body(data, end) = task {
-                    write_body(client_body, data.unwrap_or_default(), end, write_timeout)
-                        .await
-                        .map_err(|e| e.into_up())?;
-                    pending.written(bytes);
-                }
-            }
-            Ok::<_, Box<Error>>(())
-        };
+        let write = pending.write_h2(client_body, write_timeout);
         tokio::pin!(write);
 
         /* For H2 downstreams, race the upstream write against downstream stream

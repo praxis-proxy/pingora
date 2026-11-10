@@ -181,6 +181,34 @@ impl HttpSession {
         }
     }
 
+    /// Write body payload while retaining accepted progress on cancellation/error.
+    ///
+    /// The connection must be abandoned if this future is interrupted: the
+    /// legacy body framer cannot resume an incomplete chunk or flush.
+    pub async fn write_body_controlled(&mut self, buf: &[u8]) -> Result<Option<usize>> {
+        let skip = if matches!(
+            self.body_writer.body_mode,
+            super::body::BodyMode::ChunkedEncoding(_)
+        ) {
+            format!("{:X}\r\n", buf.len()).len()
+        } else {
+            0
+        };
+        let mut progress = super::body_progress::BodyProgress {
+            stream: &mut self.underlying_stream,
+            sent: &mut self.bytes_sent,
+            skip,
+            remaining: buf.len(),
+        };
+        let write = self.body_writer.write_body(&mut progress, buf);
+        match self.write_timeout {
+            Some(duration) => timeout(duration, write).await.unwrap_or_else(|_| {
+                Error::e_explain(WriteTimedout, "writing controlled request body")
+            }),
+            None => write.await,
+        }
+    }
+
     fn maybe_force_close_body_reader(&mut self) {
         if self.upgraded && self.received_upgrade_req_body && !self.body_reader.body_done() {
             // request is done, reset the response body to close
@@ -1659,6 +1687,35 @@ mod tests_stream {
             .unwrap();
         let res = http_stream.write_body(body).await;
         assert_eq!(res.unwrap_err().etype(), &WriteTimedout);
+    }
+
+    #[tokio::test]
+    async fn controlled_body_counter_survives_cancellation_after_partial_write() {
+        use tokio::io::{duplex, AsyncReadExt};
+        let (stream, mut origin) = duplex(128);
+        let mut session = HttpSession::new(Box::new(stream));
+        let mut request = RequestHeader::build("POST", b"/", None).unwrap();
+        request.insert_header("Content-Length", "256").unwrap();
+        session
+            .write_request_header(Box::new(request))
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            origin.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        assert!(tokio::time::timeout(
+            Duration::from_millis(5),
+            session.write_body_controlled(&[b'x'; 256])
+        )
+        .await
+        .is_err());
+        assert_eq!(session.body_bytes_sent(), 128);
+        let mut accepted = [0; 128];
+        origin.read_exact(&mut accepted).await.unwrap();
+        assert_eq!(accepted, [b'x'; 128]);
     }
 
     #[tokio::test]

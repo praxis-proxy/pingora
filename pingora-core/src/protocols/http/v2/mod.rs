@@ -55,6 +55,17 @@ pub async fn write_body(
     end: bool,
     write_timeout: Option<Duration>,
 ) -> Result<()> {
+    write_body_with_progress(writer, data, end, write_timeout, &mut 0).await
+}
+
+/// Write HTTP/2 payload while retaining accepted DATA bytes on interruption.
+pub async fn write_body_with_progress(
+    writer: &mut SendStream<Bytes>,
+    data: Bytes,
+    end: bool,
+    write_timeout: Option<Duration>,
+    accepted: &mut usize,
+) -> Result<()> {
     let mut remaining = data;
 
     // Cannot poll 0 capacity, so send it directly.
@@ -66,6 +77,7 @@ pub async fn write_body(
     }
 
     loop {
+        let before = remaining.len();
         match write_timeout {
             Some(t) => match timeout(t, reserve_and_send(writer, &mut remaining, end)).await {
                 Ok(res) => res?,
@@ -78,6 +90,7 @@ pub async fn write_body(
                 reserve_and_send(writer, &mut remaining, end).await?;
             }
         }
+        *accepted = accepted.saturating_add(before.saturating_sub(remaining.len()));
         if remaining.is_empty() {
             return Ok(());
         }
@@ -138,6 +151,11 @@ mod test {
                 .err()
                 .unwrap();
             assert_eq!(err.etype(), &pingora_error::ErrorType::WriteTimedout);
+            assert_eq!(
+                h2_stream.body_bytes_sent(),
+                1,
+                "accepted DATA remains charged after a write timeout"
+            );
         }));
 
         // Server

@@ -43,6 +43,17 @@ impl From<HttpTask> for RequestBodyTask {
     }
 }
 
+/// Settle accepted H2 DATA even when the write future is dropped.
+struct PrefixProgress<'a> {
+    task: &'a mut RequestBodyTask,
+    accepted: usize,
+}
+impl Drop for PrefixProgress<'_> {
+    fn drop(&mut self) {
+        self.task.written(self.accepted);
+    }
+}
+
 impl RequestBodyTask {
     pub(crate) fn new(task: HttpTask, pacer: Option<Box<dyn RequestBodyPacer>>) -> Self {
         Self {
@@ -85,6 +96,36 @@ impl RequestBodyTask {
             }
         });
         Ok((task, count))
+    }
+
+    pub(crate) fn paced(&self) -> bool {
+        self.pacer.is_some()
+    }
+
+    pub(crate) async fn write_h2(
+        &mut self,
+        writer: &mut h2::SendStream<bytes::Bytes>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<()> {
+        while !self.done() {
+            let (task, _) = self.next().await?;
+            if let HttpTask::Body(data, end) = task {
+                let mut progress = PrefixProgress {
+                    task: self,
+                    accepted: 0,
+                };
+                pingora_core::protocols::http::v2::write_body_with_progress(
+                    writer,
+                    data.unwrap_or_default(),
+                    end,
+                    timeout,
+                    &mut progress.accepted,
+                )
+                .await
+                .map_err(|error| error.into_up())?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn written(&mut self, bytes: usize) {

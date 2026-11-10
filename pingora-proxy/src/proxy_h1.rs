@@ -341,13 +341,16 @@ where
                     // tunnel's own end (UpgradedBody end, or a closed pipe) ends an
                     // upgraded relay.
                     let pre_upgrade_request = matches!(body, Some(HttpTask::Body(..)));
-                    let baseline = client_session.body_bytes_sent();
-                    let result = send_body_to1(client_session, body).await;
-                    let held = pending.as_mut().unwrap();
-                    held.written(client_session.body_bytes_sent().saturating_sub(baseline));
+                    let mut progress = RequestWrite {
+                        baseline: client_session.body_bytes_sent(), client: client_session,
+                        task: pending.as_mut().unwrap(),
+                    };
+                    let paced = progress.task.paced();
+                    let result = send_body_to1(progress.client, body, paced).await;
+                    drop(progress);
                     match result {
                         Ok(send_done) => {
-                            if held.done() { pending = None; }
+                            if pending.as_ref().unwrap().done() { pending = None; }
                             if !(upgraded && pre_upgrade_request) {
                                 request_done = send_done;
                                 // An upgraded request is terminated when either side is done
@@ -1123,9 +1126,23 @@ where
     }
 }
 
+/// Keep accepted progress observable when a task write is interrupted.
+struct RequestWrite<'a> {
+    client: &'a mut HttpSessionV1,
+    task: &'a mut RequestBodyTask,
+    baseline: usize,
+}
+impl Drop for RequestWrite<'_> {
+    fn drop(&mut self) {
+        self.task
+            .written(self.client.body_bytes_sent().saturating_sub(self.baseline));
+    }
+}
+
 pub(crate) async fn send_body_to1(
     client_session: &mut HttpSessionV1,
     recv_task: Option<HttpTask>,
+    paced: bool,
 ) -> Result<bool> {
     let body_done;
 
@@ -1134,7 +1151,11 @@ pub(crate) async fn send_body_to1(
             HttpTask::Body(data, end) => {
                 body_done = end;
                 if let Some(d) = data {
-                    let m = client_session.write_body(&d).await;
+                    let m = if paced {
+                        client_session.write_body_controlled(&d).await
+                    } else {
+                        client_session.write_body(&d).await
+                    };
                     match m {
                         Ok(m) => match m {
                             Some(n) => {
@@ -1155,7 +1176,11 @@ pub(crate) async fn send_body_to1(
 
                 body_done = end;
                 if let Some(d) = data {
-                    let m = client_session.write_body(&d).await;
+                    let m = if paced {
+                        client_session.write_body_controlled(&d).await
+                    } else {
+                        client_session.write_body(&d).await
+                    };
                     match m {
                         Ok(m) => match m {
                             Some(n) => {

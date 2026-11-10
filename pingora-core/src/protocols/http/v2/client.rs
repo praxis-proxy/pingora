@@ -70,6 +70,8 @@ pub struct Http2Session {
     ended: bool,
     // Total DATA payload bytes received from upstream response
     body_recv: usize,
+    /// DATA payload accepted by the upstream send stream, including interrupted writes.
+    body_sent: usize,
 }
 
 impl Drop for Http2Session {
@@ -92,6 +94,7 @@ impl Http2Session {
             conn,
             ended: false,
             body_recv: 0,
+            body_sent: 0,
         }
     }
 
@@ -163,11 +166,22 @@ impl Http2Session {
             .as_mut()
             .expect("Try to write request body before sending request header");
 
-        super::write_body(body_writer, data, end, self.write_timeout)
-            .await
-            .map_err(|e| self.handle_err(e))?;
+        super::write_body_with_progress(
+            body_writer,
+            data,
+            end,
+            self.write_timeout,
+            &mut self.body_sent,
+        )
+        .await
+        .map_err(|e| self.handle_err(e))?;
         self.ended = self.ended || end;
         Ok(())
+    }
+
+    /// Request DATA payload accepted, including partial writes before failure.
+    pub fn body_bytes_sent(&self) -> usize {
+        self.body_sent
     }
 
     /// Signal that the request body has ended
