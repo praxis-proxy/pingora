@@ -165,6 +165,24 @@ where
         Ok(())
     }
 
+    /// Transfer pacing ownership for the body produced by `request_body_filter`.
+    ///
+    /// The upstream writer requests bounded prefixes and acknowledges successful
+    /// writes. Dropping the pacer must refund bytes not acknowledged. Returning
+    /// `None` keeps the ordinary body-write path. Called once per filtered chunk,
+    /// including replayed chunks; it must not run the body filters again.
+    fn request_body_pacer(
+        &self,
+        _session: &mut Session<DS>,
+        _bytes: usize,
+        _ctx: &mut Self::CTX,
+    ) -> Option<Box<dyn crate::RequestBodyPacer>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        None
+    }
+
     /// This filter decides if the request is cacheable and what cache backend to use
     ///
     /// The caller can interact with `Session.cache` to enable caching.

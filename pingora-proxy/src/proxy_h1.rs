@@ -148,7 +148,7 @@ where
         };
 
         let (tx_upstream, rx_upstream) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
-        let (tx_downstream, rx_downstream) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
+        let (tx_downstream, rx_downstream) = mpsc::channel::<RequestBodyTask>(TASK_BUFFER_SIZE);
 
         session.as_mut().enable_retry_buffering();
 
@@ -257,7 +257,7 @@ where
         &self,
         client_session: &mut HttpSessionV1,
         tx: mpsc::Sender<HttpTask>,
-        mut rx: mpsc::Receiver<HttpTask>,
+        mut rx: mpsc::Receiver<RequestBodyTask>,
         pipe_state: Arc<AtomicU8>,
     ) -> Result<bool>
     where
@@ -269,6 +269,7 @@ where
         let mut upstream_can_reuse = true;
         let mut send_error = None;
         let mut upgraded = false;
+        let mut pending: Option<RequestBodyTask> = None;
 
         /* duplex mode, wait for either to complete */
         while !request_done || !response_done {
@@ -331,15 +332,22 @@ where
                     }
                 },
 
-                body = rx.recv(), if !request_done => {
+                body = async { pending.as_mut().unwrap().next().await }, if !request_done && pending.is_some() => {
+                    let (task, _bytes) = body?;
+                    let body = Some(task);
                     // A framed Body belongs to the HTTP request sent before the
                     // protocol switch. Its end only completes that request, and it
                     // can arrive after a fast 101 or CONNECT 2xx was read. Only the
                     // tunnel's own end (UpgradedBody end, or a closed pipe) ends an
                     // upgraded relay.
                     let pre_upgrade_request = matches!(body, Some(HttpTask::Body(..)));
-                    match send_body_to1(client_session, body).await {
+                    let baseline = client_session.body_bytes_sent();
+                    let result = send_body_to1(client_session, body).await;
+                    let held = pending.as_mut().unwrap();
+                    held.written(client_session.body_bytes_sent().saturating_sub(baseline));
+                    match result {
                         Ok(send_done) => {
+                            if held.done() { pending = None; }
                             if !(upgraded && pre_upgrade_request) {
                                 request_done = send_done;
                                 // An upgraded request is terminated when either side is done
@@ -351,6 +359,7 @@ where
                         Err(e) => {
                            warn!("send error, draining read buf: {e}");
                            request_done = true;
+                           pending = None;
 
                            // Built-in HTTP downstream sessions are expected to reject
                            // incomplete bodies before reaching this state. A downstream
@@ -363,6 +372,10 @@ where
                            continue
                         }
                     }
+                },
+
+                body = rx.recv(), if !request_done && pending.is_none() => {
+                    pending = Some(body.unwrap_or_else(|| HttpTask::Body(None, true).into()));
                 },
 
                 else => {
@@ -463,7 +476,7 @@ where
     async fn proxy_handle_downstream(
         &self,
         session: &mut Session<DS>,
-        tx: mpsc::Sender<HttpTask>,
+        tx: mpsc::Sender<RequestBodyTask>,
         mut rx: mpsc::Receiver<HttpTask>,
         ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
@@ -1051,7 +1064,7 @@ where
         session: &mut Session<DS>,
         mut data: Option<Bytes>,
         end_of_body: bool,
-        tx: mpsc::Permit<'_, HttpTask>,
+        tx: mpsc::Permit<'_, RequestBodyTask>,
         ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> Result<bool>
     where
@@ -1091,10 +1104,19 @@ where
         );
 
         // upgraded body needs to be marked
+        let pacer =
+            self.inner
+                .request_body_pacer(session, data.as_ref().map_or(0, Bytes::len), ctx);
         if session.was_upgraded() {
-            tx.send(HttpTask::UpgradedBody(data, upstream_end_of_body));
+            tx.send(RequestBodyTask::new(
+                HttpTask::UpgradedBody(data, upstream_end_of_body),
+                None,
+            ));
         } else {
-            tx.send(HttpTask::Body(data, upstream_end_of_body));
+            tx.send(RequestBodyTask::new(
+                HttpTask::Body(data, upstream_end_of_body),
+                pacer,
+            ));
         }
 
         Ok(end_of_body)
@@ -1135,16 +1157,16 @@ pub(crate) async fn send_body_to1(
                 if let Some(d) = data {
                     let m = client_session.write_body(&d).await;
                     match m {
-                        Ok(m) => {
-                            match m {
-                                Some(n) => {
-                                    debug!("Write {} bytes upgraded body to upstream", n);
-                                }
-                                None => {
-                                    warn!("Upstream upgraded body is already finished. Nothing to write");
-                                }
+                        Ok(m) => match m {
+                            Some(n) => {
+                                debug!("Write {} bytes upgraded body to upstream", n);
                             }
-                        }
+                            None => {
+                                warn!(
+                                    "Upstream upgraded body is already finished. Nothing to write"
+                                );
+                            }
+                        },
                         Err(e) => {
                             return e.into_up().into_err();
                         }
@@ -1191,6 +1213,71 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
+
+    struct WaitingPacer(Arc<tokio::sync::Notify>);
+
+    #[async_trait]
+    impl crate::RequestBodyPacer for WaitingPacer {
+        async fn next(&mut self, _: usize) -> Result<usize> {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+        fn written(&mut self, _: usize) {
+            panic!("waiting bytes must not be written")
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_response_is_read_while_upload_admission_waits() {
+        use tokio::io::AsyncReadExt;
+        let proxy = HttpProxy::new(PassThrough, Arc::new(ServerConf::default()));
+        let (proxy_io, mut origin) = tokio::io::duplex(4096);
+        let mut client = HttpSessionV1::new(Box::new(proxy_io));
+        let downstream =
+            request_session(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\n")
+                .await;
+        client
+            .write_request_header(Box::new(downstream.req_header().clone()))
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            origin.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        let (tx_up, mut rx_up) = mpsc::channel(4);
+        let (tx_down, rx_down) = mpsc::channel(4);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        tx_down
+            .send(RequestBodyTask::new(
+                HttpTask::Body(Some(Bytes::from_static(b"body")), true),
+                Some(Box::new(WaitingPacer(entered.clone()))),
+            ))
+            .await
+            .ok()
+            .unwrap();
+        let relay = proxy.proxy_handle_upstream(
+            &mut client,
+            tx_up,
+            rx_down,
+            Arc::new(AtomicU8::new(PipeState::Active as u8)),
+        );
+        tokio::pin!(relay);
+        tokio::select! {
+            result = &mut relay => panic!("relay ended before admission: {result:?}"),
+            _ = entered.notified() => {}
+        }
+        origin
+            .write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::select! {
+            result = &mut relay => panic!("relay ended before response: {result:?}"),
+            task = rx_up.recv() => assert!(matches!(task, Some(HttpTask::Header(head, _)) if head.status == 413)),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("upload admission blocked the response"),
+        }
+    }
 
     struct ResponseFilter101;
 
@@ -1550,7 +1637,10 @@ mod tests {
         match end_marker {
             EndMarker::BeforeResponse => {
                 // The relay consumes the marker while no response is readable yet.
-                tx_down.send(HttpTask::Body(None, true)).await.unwrap();
+                tx_down
+                    .send(HttpTask::Body(None, true).into())
+                    .await
+                    .unwrap();
                 while tx_down.capacity() < PIPE {
                     tokio::select! {
                         biased;
@@ -1580,13 +1670,13 @@ mod tests {
         }
 
         if let EndMarker::AfterResponse = end_marker {
-            tx_down.send(HttpTask::Body(None, true)).await.unwrap();
+            tx_down
+                .send(HttpTask::Body(None, true).into())
+                .await
+                .unwrap();
         }
         tx_down
-            .send(HttpTask::UpgradedBody(
-                Some(Bytes::from_static(b"hello")),
-                false,
-            ))
+            .send(HttpTask::UpgradedBody(Some(Bytes::from_static(b"hello")), false).into())
             .await
             .unwrap();
 
@@ -1604,7 +1694,7 @@ mod tests {
 
         // The tunnel's own end still ends the relay.
         tx_down
-            .send(HttpTask::UpgradedBody(None, true))
+            .send(HttpTask::UpgradedBody(None, true).into())
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), &mut relay)

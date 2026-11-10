@@ -56,7 +56,7 @@ fn h2_path_and_query(header: &RequestHeader) -> Result<http::uri::PathAndQuery> 
             return Error::e_explain(
                 InvalidHTTPHeader,
                 "ambiguous HTTP absolute-form request target",
-            )
+            );
         }
         RawTargetAuthority::Absolute { path_and_query, .. } => path_and_query,
     };
@@ -1097,6 +1097,22 @@ where
             }
         };
 
+        let pacer = self.inner.request_body_pacer(session, data.len(), ctx);
+        let mut pending = RequestBodyTask::new(HttpTask::Body(Some(data), end), pacer);
+        let write = async {
+            while !pending.done() {
+                let (task, bytes) = pending.next().await?;
+                if let HttpTask::Body(data, end) = task {
+                    write_body(client_body, data.unwrap_or_default(), end, write_timeout)
+                        .await
+                        .map_err(|e| e.into_up())?;
+                    pending.written(bytes);
+                }
+            }
+            Ok::<_, Box<Error>>(())
+        };
+        tokio::pin!(write);
+
         /* For H2 downstreams, race the upstream write against downstream stream
          * closure. A write blocked on upstream flow control would otherwise keep the
          * downstream stream handles referenced while a downstream RST_STREAM goes
@@ -1105,8 +1121,8 @@ where
         if let Some(stream_close) = session.downstream_session.watch_h2_stream_close() {
             tokio::select! {
                 biased;
-                res = write_body(client_body, data, end, write_timeout) => {
-                    res.map_err(|e| e.into_up())?;
+                res = &mut write => {
+                    res?;
                 }
                 close_result = stream_close => {
                     return match close_result {
@@ -1120,9 +1136,7 @@ where
                 }
             }
         } else {
-            write_body(client_body, data, end, write_timeout)
-                .await
-                .map_err(|e| e.into_up())?;
+            write.await?;
         }
 
         Ok(end_of_body)
