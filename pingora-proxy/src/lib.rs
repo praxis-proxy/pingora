@@ -226,6 +226,10 @@ impl<SV> HttpProxy<SV, (), ()> {
     /// // Use proxy.process_new_http() in your custom accept loop
     /// ```
     pub fn new(inner: SV, conf: Arc<ServerConf>) -> Self {
+        // Test binaries can unify reqwest's TLS features with multiple providers.
+        // Production applications continue to select their own provider.
+        #[cfg(all(test, feature = "rustls"))]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         HttpProxy {
             inner,
             client_upstream: Connector::new(Some(ConnectorOptions::from_server_conf(&conf))),

@@ -341,7 +341,7 @@ where
                     // tunnel's own end (UpgradedBody end, or a closed pipe) ends an
                     // upgraded relay.
                     let pre_upgrade_request = matches!(body, Some(HttpTask::Body(..)));
-                    let mut progress = RequestWrite {
+                    let progress = RequestWrite {
                         baseline: client_session.body_bytes_sent(), client: client_session,
                         task: pending.as_mut().unwrap(),
                     };

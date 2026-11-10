@@ -40,6 +40,8 @@ regex = "1"
 rand = "0.10"
 
 [dev-dependencies]
+# Unit tests create connectors without an embedding application's TLS setup.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 reqwest = { version = "0.12", features = [
     "gzip",
     "rustls-tls",
